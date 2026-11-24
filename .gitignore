@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.o
+*.asi
+*.gguf
+build/
+*.egg-info/
