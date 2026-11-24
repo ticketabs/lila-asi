@@ -764,7 +764,7 @@ class AsiRuntime:
             if active_tools is not None:
                 raw_tools = list(active_tools)
             else:
-                from src.harness.tools import get_registry
+                from src.harness.tools import Tool, ToolArg, get_registry
                 from src.harness.system_tools import register_all_system_tools
                 from src.harness.extended_tools import register_extended_tools
 
@@ -772,7 +772,62 @@ class AsiRuntime:
                 if not reg.get("file_read"):
                     register_all_system_tools()
                     register_extended_tools()
-                raw_tools = reg.all() if hasattr(reg, "all") else reg.list_tools()
+                raw_tools = list(reg.all() if hasattr(reg, "all") else reg.list_tools())
+                existing_names = {t.name for t in raw_tools}
+                meta_tools = [
+                    Tool(
+                        name="discover_capabilities",
+                        description="Search tools, skills, and capabilities.",
+                        args=[
+                            ToolArg("query", "string", "Search query", required=True),
+                            ToolArg("kind", "string", "Filter kind", required=False),
+                            ToolArg("limit", "int", "Max matches", required=False),
+                        ],
+                        execute=lambda **_: None,
+                    ),
+                    Tool(
+                        name="activate_capability",
+                        description="Activate a capability bundle.",
+                        args=[
+                            ToolArg("capability_id", "string", "Bundle ID", required=True),
+                            ToolArg("reason", "string", "Activation reason", required=False),
+                            ToolArg("task_id", "string", "Task ID", required=False),
+                            ToolArg("ttl_turns", "int", "TTL turns", required=False),
+                        ],
+                        execute=lambda **_: None,
+                    ),
+                    Tool(
+                        name="deactivate_capability",
+                        description="Deactivate a capability bundle.",
+                        args=[
+                            ToolArg("capability_id", "string", "Bundle ID", required=True),
+                            ToolArg("outcome_summary", "string", "Outcome summary", required=False),
+                        ],
+                        execute=lambda **_: None,
+                    ),
+                    Tool(
+                        name="request_capability_creation",
+                        description="Propose a missing skill or tool.",
+                        args=[
+                            ToolArg("kind", "string", "Entity kind", required=True),
+                            ToolArg("title", "string", "Title", required=True),
+                            ToolArg("problem", "string", "Problem statement", required=True),
+                            ToolArg("proposed_inputs", "string", "Proposed inputs", required=False),
+                        ],
+                        execute=lambda **_: None,
+                    ),
+                    Tool(
+                        name="load_tool_schema",
+                        description="Load full argument schemas for 1-3 tools.",
+                        args=[
+                            ToolArg("tools", "string", "Tool names", required=True),
+                        ],
+                        execute=lambda **_: None,
+                    ),
+                ]
+                for mt in meta_tools:
+                    if mt.name not in existing_names:
+                        raw_tools.append(mt)
             all_tools = sorted(raw_tools, key=lambda t: t.name)[:512]
         except ImportError:
             return False
