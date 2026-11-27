@@ -13,13 +13,10 @@ static void lhc_asi_dispatch(void *pool_opaque, LilaLhcTaskFn fn, void *ctx)
 }
 #include <errno.h>
 #include <math.h>
-#include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include <unistd.h>
 
 #define ASI_SPEC_MAX_K 3u
 #define ASI_SPEC_FAIL_CAP 512u
@@ -32,6 +29,7 @@ typedef struct {
     int fused_chunk;
     int fused_chunk_overridden;
     int batch_chunk_max;
+    int blis_min_tokens;
     int profile;
     int speculative;
     int spec_draft_len;
@@ -39,7 +37,7 @@ typedef struct {
 } AsiRuntimeConfig;
 
 static AsiRuntimeConfig g_asi_rt_cfg;
-static pthread_once_t g_asi_rt_cfg_once = PTHREAD_ONCE_INIT;
+static AsiOnce g_asi_rt_cfg_once = ASI_ONCE_INIT;
 
 static int asi_env_int(const char *name, int def_val, int min_val, int *overridden)
 {
@@ -64,6 +62,7 @@ static void asi_init_runtime_config(void)
     g_asi_rt_cfg.lmhead_chunk = asi_env_int("LILA_ASI_LMHEAD_CHUNK", 512, 1, NULL);
     g_asi_rt_cfg.fused_chunk = asi_env_int("LILA_ASI_FUSED_CHUNK", 32, 1, &g_asi_rt_cfg.fused_chunk_overridden);
     g_asi_rt_cfg.batch_chunk_max = asi_env_int("LILA_ASI_BATCH_CHUNK_MAX", 512, 1, NULL);
+    g_asi_rt_cfg.blis_min_tokens = asi_env_int("LILA_ASI_BLIS_MIN_TOKENS", 96, 1, NULL);
     const char *prof = getenv("LILA_ASI_PROFILE");
     g_asi_rt_cfg.profile = (prof && prof[0] != '\0' && strcmp(prof, "0") != 0) ? 1 : 0;
     g_asi_rt_cfg.speculative = asi_env_int("LILA_ASI_SPECULATIVE", 1, 0, NULL) ? 1 : 0;
@@ -76,15 +75,13 @@ static void asi_init_runtime_config(void)
 
 static inline const AsiRuntimeConfig *asi_runtime_config(void)
 {
-    pthread_once(&g_asi_rt_cfg_once, asi_init_runtime_config);
+    asi_call_once(&g_asi_rt_cfg_once, asi_init_runtime_config);
     return &g_asi_rt_cfg;
 }
 
 static inline double asi_now_ms(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec * 1e-6;
+    return (double)asi_monotonic_ns() * 1e-6;
 }
 
 typedef enum {
@@ -233,6 +230,15 @@ struct AsiArchSession {
     uint64_t stat_spec_gate_skips;
     /* Exp E06: State-Centric CoW dirty tracking */
     uint32_t kv_dirty_from;
+    /* ASI v2.5: Multimodal M-RoPE coordinate offset (rope_pos - kv_pos) */
+    int64_t mrope_pos_delta;
+    int64_t prefix_mrope_delta;
+    /* ASI v2.6 (Torrent): post-activation sparse ffn_down keep fraction + Q4_REPACK flag */
+    float ffn_sparse_keep;
+    int has_q4_repack;
+    /* Optional activation calibration hook (NULL unless explicitly attached) */
+    void (*calib_hook)(void *, uint32_t, int, const float *, uint32_t, uint32_t);
+    void *calib_ctx;
 };
 
 #if defined(__AVX2__)
@@ -659,6 +665,7 @@ typedef struct {
     int rows[4];
     uint32_t quant_type[4];
     int is_repacked[4];
+    int is_col_major[4];
     int n_mats;
     const float *in;
     int n_tokens;
@@ -671,19 +678,19 @@ static void asi_fp32_eval_mat_range(const AsiFp32BatchCtx *ctx, int m, int start
 {
     if (ctx->n_tokens <= 1)
     {
-        size_t rb = lila_quant_row_bytes(ctx->quant_type[m], ctx->cols, ctx->is_repacked[m]);
-        if (rb == 0) return;
         for (int i = start; i < end; ++i)
         {
-            ctx->out[m][i] = lila_quant_dot_fp32(ctx->w[m] + (size_t)i * rb, ctx->in,
-                                                 ctx->cols, ctx->quant_type[m], ctx->is_repacked[m]);
+            ctx->out[m][i] = lila_quant_dot_fp32_at(
+                ctx->w[m], i, ctx->in, ctx->cols, ctx->rows[m],
+                ctx->quant_type[m], ctx->is_repacked[m], ctx->is_col_major[m]);
         }
     }
     else
     {
-        lila_quant_matmul_batch_fp32_range(ctx->w[m], ctx->in, ctx->cols, ctx->out[m],
-                                            ctx->n_tokens, ctx->rows[m], start, end,
-                                            ctx->cols, ctx->quant_type[m], ctx->is_repacked[m]);
+        lila_quant_matmul_batch_fp32_range_ex(
+            ctx->w[m], ctx->in, ctx->cols, ctx->out[m],
+            ctx->n_tokens, ctx->rows[m], start, end,
+            ctx->cols, ctx->quant_type[m], ctx->is_repacked[m], ctx->is_col_major[m]);
     }
 }
 
@@ -760,6 +767,7 @@ static int matmul_fp32_pool(AsiThreadPool *pool,
         ctx.rows[m] = (int)ts[m]->shape[1];
         ctx.quant_type[m] = ts[m]->quant_type;
         ctx.is_repacked[m] = (ts[m]->layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK) ? 1 : 0;
+        ctx.is_col_major[m] = (ts[m]->layout_flags & ASI_TENSOR_LAYOUT_COL_MAJOR) ? 1 : 0;
         atomic_init(&ctx.next_row[m], 0);
         if (ctx.rows[m] > max_rows) max_rows = ctx.rows[m];
     }
@@ -769,6 +777,133 @@ static int matmul_fp32_pool(AsiThreadPool *pool,
         asi_fp32_batch_worker(0, 1, &ctx);
     return 0;
 }
+
+typedef struct {
+    const uint8_t *w[4];
+    float *out[4];
+    int rows[4];
+    int n_mats;
+    const LilaQ8_64Block *qx64;
+    const LilaQ3LutBlock *q3_luts;
+    int n_blk64;
+    int n_blk128;
+    uint32_t quant_type[4];
+    int apply_silu_mul;
+    _Alignas(64) atomic_int next_row[4];
+} AsiE07FusedMatvecCtx;
+
+static void asi_e07_fused_matvec_worker(int tid, int n_threads, void *vctx)
+{
+    (void)tid;
+    AsiE07FusedMatvecCtx *ctx = (AsiE07FusedMatvecCtx *)vctx;
+    if (n_threads <= 1)
+    {
+        for (int m = 0; m < ctx->n_mats; ++m)
+        {
+            if (ctx->quant_type[m] == ASI_QUANT_Q4_REPACK)
+                q4_repack_matvec_range(ctx->out[m], ctx->w[m], ctx->qx64, 0, ctx->rows[m], ctx->n_blk64);
+            else if (ctx->quant_type[m] == ASI_QUANT_Q3_SPLITLUT)
+                q3_splitlut_matvec_range(ctx->out[m], ctx->w[m], ctx->q3_luts, 0, ctx->rows[m], ctx->rows[m], ctx->n_blk128);
+        }
+        if (ctx->apply_silu_mul && ctx->n_mats == 2 && ctx->rows[0] == ctx->rows[1])
+            fast_silu_mul_vec(ctx->out[0], ctx->out[1], (uint32_t)ctx->rows[0]);
+        return;
+    }
+
+    if (ctx->apply_silu_mul && ctx->n_mats == 2 && ctx->rows[0] == ctx->rows[1] &&
+        ctx->quant_type[0] == ctx->quant_type[1])
+    {
+        int total = ctx->rows[0];
+        int chunk = (ctx->quant_type[0] == ASI_QUANT_Q3_SPLITLUT) ? Q3_SPLITLUT_TILE_ROWS : 64;
+        for (;;)
+        {
+            int start = atomic_fetch_add_explicit(&ctx->next_row[0], chunk, memory_order_relaxed);
+            if (start >= total) break;
+            int end = start + chunk;
+            if (end > total) end = total;
+            for (int m = 0; m < 2; ++m)
+            {
+                if (ctx->quant_type[m] == ASI_QUANT_Q4_REPACK)
+                    q4_repack_matvec_range(ctx->out[m], ctx->w[m], ctx->qx64, start, end, ctx->n_blk64);
+                else
+                    q3_splitlut_matvec_range(ctx->out[m], ctx->w[m], ctx->q3_luts, start, end, total, ctx->n_blk128);
+            }
+            fast_silu_mul_vec(ctx->out[0] + start, ctx->out[1] + start, (uint32_t)(end - start));
+        }
+        return;
+    }
+
+    for (int m = 0; m < ctx->n_mats; ++m)
+    {
+        int total = ctx->rows[m];
+        int chunk = (ctx->quant_type[m] == ASI_QUANT_Q3_SPLITLUT) ? Q3_SPLITLUT_TILE_ROWS : 64;
+        for (;;)
+        {
+            int start = atomic_fetch_add_explicit(&ctx->next_row[m], chunk, memory_order_relaxed);
+            if (start >= total) break;
+            int end = start + chunk;
+            if (end > total) end = total;
+            if (ctx->quant_type[m] == ASI_QUANT_Q4_REPACK)
+                q4_repack_matvec_range(ctx->out[m], ctx->w[m], ctx->qx64, start, end, ctx->n_blk64);
+            else if (ctx->quant_type[m] == ASI_QUANT_Q3_SPLITLUT)
+                q3_splitlut_matvec_range(ctx->out[m], ctx->w[m], ctx->q3_luts, start, end, total, ctx->n_blk128);
+        }
+    }
+}
+
+typedef struct {
+    const uint8_t *w;
+    const LilaQ8_64Block *qx64;
+    const LilaQ3LutBlock *q3_luts;
+    float *out;
+    int rows;
+    int n_blk64;
+    int n_blk128;
+    uint32_t quant_type;
+    _Alignas(64) atomic_int next_row;
+    int chunk_rows;
+} AsiE07MatvecCtx;
+
+static void asi_e07_matvec_worker(int tid, int n_threads, void *vctx)
+{
+    (void)tid;
+    AsiE07MatvecCtx *ctx = (AsiE07MatvecCtx *)vctx;
+    int rows = ctx->rows;
+    if (n_threads <= 1)
+    {
+        if (ctx->quant_type == ASI_QUANT_Q4_REPACK)
+            q4_repack_matvec_range(ctx->out, ctx->w, ctx->qx64, 0, rows, ctx->n_blk64);
+        else
+            q3_splitlut_matvec_range(ctx->out, ctx->w, ctx->q3_luts, 0, rows, rows, ctx->n_blk128);
+        return;
+    }
+    int chunk = ctx->chunk_rows;
+    for (;;)
+    {
+        int start = atomic_fetch_add_explicit(&ctx->next_row, chunk, memory_order_relaxed);
+        if (start >= rows) break;
+        int end = start + chunk;
+        if (end > rows) end = rows;
+        if (ctx->quant_type == ASI_QUANT_Q4_REPACK)
+            q4_repack_matvec_range(ctx->out, ctx->w, ctx->qx64, start, end, ctx->n_blk64);
+        else
+            q3_splitlut_matvec_range(ctx->out, ctx->w, ctx->q3_luts, start, end, rows, ctx->n_blk128);
+    }
+}
+
+static inline int asi_tensor_needs_q8k(const AsiV2TensorEntry *t)
+{
+    if (!t) return 0;
+    return (t->quant_type == 12u ||
+            (t->quant_type == 14u && !(t->layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK))) ? 1 : 0;
+}
+
+static int matvec_tensor_pool(AsiThreadPool *pool,
+                              const AsiV2Cartridge *cart,
+                              const AsiV2TensorEntry *t,
+                              float *out,
+                              const float *in,
+                              int fp32_ref);
 
 static void matvec_fused_q8k_pool(AsiThreadPool *pool,
                                   const AsiV2Cartridge *cart,
@@ -784,14 +919,76 @@ static void matvec_fused_q8k_pool(AsiThreadPool *pool,
 {
     if (!fp32_ref)
     {
+        int all_q8k = 1;
+        int any_q4r = 0, any_q3 = 0, all_e07_rm = 1;
         for (int m = 0; m < n_mats; ++m)
         {
-            if ((tensors[m]->quant_type != 12 && tensors[m]->quant_type != 14) ||
-                (tensors[m]->layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK))
+            uint32_t qt = tensors[m]->quant_type;
+            uint32_t lf = tensors[m]->layout_flags;
+            if ((qt != 12u && qt != 14u) || (lf & ASI_TENSOR_LAYOUT_AVX2_REPACK))
+                all_q8k = 0;
+            if (qt == ASI_QUANT_Q4_REPACK && !(lf & ASI_TENSOR_LAYOUT_COL_MAJOR))
+                any_q4r = 1;
+            else if (qt == ASI_QUANT_Q3_SPLITLUT)
+                any_q3 = 1;
+            else
+                all_e07_rm = 0;
+        }
+        if (!all_q8k)
+        {
+            if (all_e07_rm && (any_q4r || any_q3))
             {
-                fp32_ref = 1;
-                break;
+                int n_blk64 = (cols + Q4_REPACK_GROUP_SIZE - 1) / Q4_REPACK_GROUP_SIZE;
+                int n_blk128 = (cols + Q3_SPLITLUT_BLK_COLS - 1) / Q3_SPLITLUT_BLK_COLS;
+                LilaQ8_64Block stack_qx64[64];
+                LilaQ8_64Block *qx64 = NULL;
+                LilaQ3LutBlock stack_q3[32];
+                LilaQ3LutBlock *q3_luts = NULL;
+                if (any_q4r)
+                {
+                    qx64 = (n_blk64 <= 64) ? stack_qx64 : lila_q8_64_alloc((size_t)n_blk64);
+                    if (!qx64) { matmul_fp32_pool(pool, cart, tensors, outs, n_mats, in, 1, cols, apply_silu_mul); return; }
+                    quantize_vec_q8_64(qx64, in, cols);
+                }
+                if (any_q3)
+                {
+                    q3_luts = (n_blk128 <= 32) ? stack_q3 : (LilaQ3LutBlock *)asi_aligned_alloc(32, (size_t)n_blk128 * sizeof(LilaQ3LutBlock));
+                    if (!q3_luts) { if (qx64 && qx64 != stack_qx64) lila_q8_64_free(qx64); matmul_fp32_pool(pool, cart, tensors, outs, n_mats, in, 1, cols, apply_silu_mul); return; }
+                    q3_splitlut_build_lut(q3_luts, in, cols);
+                }
+                AsiE07FusedMatvecCtx ctx;
+                memset(&ctx, 0, sizeof(ctx));
+                ctx.n_mats = n_mats;
+                ctx.qx64 = qx64;
+                ctx.q3_luts = q3_luts;
+                ctx.n_blk64 = n_blk64;
+                ctx.n_blk128 = n_blk128;
+                ctx.apply_silu_mul = apply_silu_mul;
+                int max_rows = 0;
+                for (int m = 0; m < n_mats; ++m)
+                {
+                    ctx.w[m] = tensor_data(cart, tensors[m]);
+                    ctx.out[m] = outs[m];
+                    ctx.rows[m] = (int)tensors[m]->shape[1];
+                    ctx.quant_type[m] = tensors[m]->quant_type;
+                    atomic_init(&ctx.next_row[m], 0);
+                    if (ctx.rows[m] > max_rows) max_rows = ctx.rows[m];
+                }
+                if (pool && max_rows >= 64)
+                    asi_pool_run(pool, asi_e07_fused_matvec_worker, &ctx);
+                else
+                    asi_e07_fused_matvec_worker(0, 1, &ctx);
+                if (qx64 && qx64 != stack_qx64) lila_q8_64_free(qx64);
+                if (q3_luts && q3_luts != stack_q3) asi_aligned_free(q3_luts);
+                return;
             }
+            if (!apply_silu_mul)
+            {
+                for (int m = 0; m < n_mats; ++m)
+                    matvec_tensor_pool(pool, cart, tensors[m], outs[m], in, 0);
+                return;
+            }
+            fp32_ref = 1;
         }
     }
     if (fp32_ref)
@@ -821,6 +1018,81 @@ static void matvec_fused_q8k_pool(AsiThreadPool *pool,
         asi_fused_matvec_worker(0, 1, &ctx);
 }
 
+typedef struct {
+    const uint8_t *w;
+    const float *in;
+    float *out;
+    int total_rows;
+    int cols;
+    const uint32_t *active_cols;
+    int n_active;
+    _Alignas(64) atomic_int next_row;
+} AsiQ4ColMajorCtx;
+
+static void asi_q4_col_major_worker(int tid, int n_threads, void *vctx)
+{
+    (void)tid;
+    AsiQ4ColMajorCtx *ctx = (AsiQ4ColMajorCtx *)vctx;
+    if (n_threads <= 1)
+    {
+        q4_repack_col_major_matvec_range(ctx->out, ctx->w, ctx->in, 0, ctx->total_rows,
+                                         ctx->total_rows, ctx->cols,
+                                         ctx->active_cols, ctx->n_active);
+        return;
+    }
+    int chunk = Q4_REPACK_GROUP_SIZE * 2;
+    for (;;)
+    {
+        int start = atomic_fetch_add_explicit(&ctx->next_row, chunk, memory_order_relaxed);
+        if (start >= ctx->total_rows) break;
+        int end = start + chunk;
+        if (end > ctx->total_rows) end = ctx->total_rows;
+        q4_repack_col_major_matvec_range(ctx->out, ctx->w, ctx->in, start, end,
+                                         ctx->total_rows, ctx->cols,
+                                         ctx->active_cols, ctx->n_active);
+    }
+}
+
+static int matvec_q4_col_major_pool(AsiThreadPool *pool,
+                                    const AsiV2Cartridge *cart,
+                                    const AsiV2TensorEntry *t,
+                                    float *out,
+                                    const float *in,
+                                    float keep_frac)
+{
+    const uint8_t *w = tensor_data(cart, t);
+    int cols = (int)t->shape[0];
+    int rows = (int)t->shape[1];
+    uint32_t stack_active[4096];
+    uint32_t *active_cols = NULL;
+    int n_active = cols;
+    if (keep_frac > 0.0f && keep_frac < 0.999f && cols > 64)
+    {
+        uint32_t *buf = (cols <= 4096) ? stack_active : (uint32_t *)malloc((size_t)cols * sizeof(uint32_t));
+        if (buf)
+        {
+            n_active = asi_select_topk_abs_cols(in, cols, keep_frac, buf, cols);
+            active_cols = buf;
+        }
+    }
+    AsiQ4ColMajorCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.w = w;
+    ctx.in = in;
+    ctx.out = out;
+    ctx.total_rows = rows;
+    ctx.cols = cols;
+    ctx.active_cols = active_cols;
+    ctx.n_active = n_active;
+    atomic_init(&ctx.next_row, 0);
+    if (pool && rows >= Q4_REPACK_GROUP_SIZE * 2)
+        asi_pool_run(pool, asi_q4_col_major_worker, &ctx);
+    else
+        asi_q4_col_major_worker(0, 1, &ctx);
+    if (active_cols && active_cols != stack_active) free(active_cols);
+    return 0;
+}
+
 static int matvec_tensor_pool(AsiThreadPool *pool,
                               const AsiV2Cartridge *cart,
                               const AsiV2TensorEntry *t,
@@ -834,6 +1106,58 @@ static int matvec_tensor_pool(AsiThreadPool *pool,
     if (fp32_ref)
     {
         return matmul_fp32_pool(pool, cart, &t, &out, 1, in, 1, cols, 0);
+    }
+    if (t->quant_type == ASI_QUANT_Q4_REPACK && (t->layout_flags & ASI_TENSOR_LAYOUT_COL_MAJOR))
+    {
+        return matvec_q4_col_major_pool(pool, cart, t, out, in, 1.0f);
+    }
+    if (t->quant_type == ASI_QUANT_Q4_REPACK && !(t->layout_flags & ASI_TENSOR_LAYOUT_COL_MAJOR))
+    {
+        int n_blk64 = (cols + Q4_REPACK_GROUP_SIZE - 1) / Q4_REPACK_GROUP_SIZE;
+        LilaQ8_64Block stack_qx[64];
+        LilaQ8_64Block *qx = (n_blk64 <= 64) ? stack_qx : lila_q8_64_alloc((size_t)n_blk64);
+        if (!qx) return -1;
+        quantize_vec_q8_64(qx, in, cols);
+        AsiE07MatvecCtx ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.w = w;
+        ctx.qx64 = qx;
+        ctx.out = out;
+        ctx.rows = rows;
+        ctx.n_blk64 = n_blk64;
+        ctx.quant_type = ASI_QUANT_Q4_REPACK;
+        atomic_init(&ctx.next_row, 0);
+        ctx.chunk_rows = (rows >= 16384) ? asi_runtime_config()->lmhead_chunk : asi_runtime_config()->matvec_chunk;
+        if (pool && rows >= 64)
+            asi_pool_run(pool, asi_e07_matvec_worker, &ctx);
+        else
+            asi_e07_matvec_worker(0, 1, &ctx);
+        if (qx != stack_qx) lila_q8_64_free(qx);
+        return 0;
+    }
+    if (t->quant_type == ASI_QUANT_Q3_SPLITLUT)
+    {
+        int n_blk128 = (cols + Q3_SPLITLUT_BLK_COLS - 1) / Q3_SPLITLUT_BLK_COLS;
+        LilaQ3LutBlock stack_lut[32];
+        LilaQ3LutBlock *luts = (n_blk128 <= 32) ? stack_lut : (LilaQ3LutBlock *)asi_aligned_alloc(32, (size_t)n_blk128 * sizeof(LilaQ3LutBlock));
+        if (!luts) return -1;
+        q3_splitlut_build_lut(luts, in, cols);
+        AsiE07MatvecCtx ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.w = w;
+        ctx.q3_luts = luts;
+        ctx.out = out;
+        ctx.rows = rows;
+        ctx.n_blk128 = n_blk128;
+        ctx.quant_type = ASI_QUANT_Q3_SPLITLUT;
+        atomic_init(&ctx.next_row, 0);
+        ctx.chunk_rows = (rows >= 16384) ? 512 : 64;
+        if (pool && rows >= 64)
+            asi_pool_run(pool, asi_e07_matvec_worker, &ctx);
+        else
+            asi_e07_matvec_worker(0, 1, &ctx);
+        if (luts != stack_lut) asi_aligned_free(luts);
+        return 0;
     }
     if ((t->quant_type == 12 || t->quant_type == 14) && !(t->layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK))
     {
@@ -983,60 +1307,20 @@ static int matmul_batch_q8k_split_pool(AsiThreadPool *pool,
     return 0;
 }
 
-static int matmul_batch_tensor(AsiThreadPool *pool,
-                               const AsiV2Cartridge *cart,
-                               const AsiV2TensorEntry *t,
-                               float *out,
-                               const float *in,
-                               int n_tokens,
-                               int fp32_ref)
+static inline int asi_tensor_blis_supported(const AsiV2TensorEntry *t)
 {
-    const uint8_t *w = tensor_data(cart, t);
-    int cols = (int)t->shape[0];
-    int rows = (int)t->shape[1];
-    if (n_tokens <= 1)
-    {
-        return matvec_tensor_pool(pool, cart, t, out, in, fp32_ref);
-    }
-    if (fp32_ref)
-    {
-        return matmul_fp32_pool(pool, cart, &t, &out, 1, in, n_tokens, cols, 0);
-    }
-    if ((t->quant_type == 12 || t->quant_type == 14) && !(t->layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK))
-    {
-        int bpr = (cols + QK_K - 1) / QK_K;
-        size_t need = (size_t)n_tokens * (size_t)bpr;
-        LilaQ8KBlock stack_qx[256];
-        LilaQ8KBlock *qx_all = (need <= 256) ? stack_qx : lila_q8k_alloc(need);
-        if (qx_all)
-        {
-            for (int tok = 0; tok < n_tokens; ++tok)
-            {
-                quantize_vec_q8k_strided(qx_all + tok, n_tokens, in + (size_t)tok * cols, cols);
-            }
-            matmul_batch_q8k_pool(pool, cart, t, out, qx_all, n_tokens, bpr);
-            if (qx_all != stack_qx) free(qx_all);
-            return 0;
-        }
-    }
-    if (t->quant_type == 12) /* Q4_K */
-    {
-        q4k_matmul_batch(out, w, in, n_tokens, rows, cols);
-        return 0;
-    }
-    if (t->quant_type == 14) /* Q6_K */
-    {
-        if (t->layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK)
-            q6k_repacked_matmul_batch(out, w, in, n_tokens, rows, cols);
-        else
-            q6k_matmul_batch(out, w, in, n_tokens, rows, cols);
-        return 0;
-    }
-    if (lila_quant_is_supported(t->quant_type))
-    {
-        return matmul_fp32_pool(pool, cart, &t, &out, 1, in, n_tokens, cols, 0);
-    }
-    return -1;
+    if (!t || (t->layout_flags & ASI_TENSOR_LAYOUT_COL_MAJOR)) return 0;
+    if (t->quant_type == 14u && !(t->layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK))
+        return (((int)t->shape[0] % 256) == 0);
+    if (t->quant_type == ASI_QUANT_Q4_REPACK || t->quant_type == ASI_QUANT_Q3_SPLITLUT)
+        return 1;
+    return 0;
+}
+
+static inline int asi_blis_prefill_enabled(void)
+{
+    const char *e = getenv("LILA_ASI_BLIS_PREFILL");
+    return (!e || e[0] != '0') ? 1 : 0;
 }
 
 typedef struct {
@@ -1071,6 +1355,662 @@ static void quantize_batch_q8k_pool(AsiThreadPool *pool,
         asi_quantize_q8k_worker(0, 1, &ctx);
 }
 
+typedef struct {
+    LilaQ8_64Block *qx_all;
+    const float *in;
+    int n_tokens;
+    int cols;
+} AsiQuantQ8_64BatchCtx;
+
+static void asi_quantize_q8_64_worker(int tid, int n_threads, void *vctx)
+{
+    const AsiQuantQ8_64BatchCtx *ctx = (const AsiQuantQ8_64BatchCtx *)vctx;
+    int start = (ctx->n_tokens * tid) / n_threads;
+    int end = (ctx->n_tokens * (tid + 1)) / n_threads;
+    for (int tok = start; tok < end; ++tok)
+    {
+        quantize_vec_q8_64_strided(ctx->qx_all + tok, ctx->n_tokens,
+                                   ctx->in + (size_t)tok * (size_t)ctx->cols, ctx->cols);
+    }
+}
+
+static void quantize_batch_q8_64_pool(AsiThreadPool *pool,
+                                      LilaQ8_64Block *qx_all,
+                                      const float *in,
+                                      int n_tokens,
+                                      int cols)
+{
+    AsiQuantQ8_64BatchCtx ctx = {qx_all, in, n_tokens, cols};
+    if (pool && n_tokens >= 8)
+        asi_pool_run(pool, asi_quantize_q8_64_worker, &ctx);
+    else
+        asi_quantize_q8_64_worker(0, 1, &ctx);
+}
+
+typedef struct {
+    const uint8_t *w[4];
+    float *out[4];
+    int rows[4];
+    uint32_t quant_type[4];
+    int n_mats;
+    const LilaQ8_64Block *qx_all;
+    const LilaQ3LutBlock *q3_luts;
+    int n_tokens;
+    int n_blk64;
+    int n_blk128;
+    int apply_silu_mul;
+    _Alignas(64) atomic_int next_row[4];
+} AsiE07BatchCtx;
+
+static void asi_e07_batch_eval_mat_range(const AsiE07BatchCtx *ctx, int m, int start, int end)
+{
+    if (ctx->quant_type[m] == ASI_QUANT_Q4_REPACK)
+    {
+        q4_repack_matmul_batch_q8_range(ctx->out[m], ctx->w[m], ctx->qx_all,
+                                        ctx->n_tokens, start, end, ctx->rows[m], ctx->n_blk64);
+    }
+    else if (ctx->quant_type[m] == ASI_QUANT_Q3_SPLITLUT)
+    {
+        size_t tile_bytes = (size_t)ctx->n_blk128 * Q3_SPLITLUT_BLK_BYTES;
+        int t0 = start / Q3_SPLITLUT_TILE_ROWS;
+        int t1 = (end + Q3_SPLITLUT_TILE_ROWS - 1) / Q3_SPLITLUT_TILE_ROWS;
+        for (int tile = t0; tile < t1; ++tile)
+        {
+            int r_base = tile * Q3_SPLITLUT_TILE_ROWS;
+            int valid = ctx->rows[m] - r_base;
+            if (valid > Q3_SPLITLUT_TILE_ROWS) valid = Q3_SPLITLUT_TILE_ROWS;
+            const uint8_t *tp = ctx->w[m] + (size_t)tile * tile_bytes;
+            for (int tok = 0; tok < ctx->n_tokens; ++tok)
+            {
+                const LilaQ3LutBlock *lb = ctx->q3_luts + (size_t)tok * (size_t)ctx->n_blk128;
+                if (r_base >= start && r_base + valid <= end)
+                {
+                    q3_splitlut_tile_simd(tp, ctx->n_blk128, lb, valid,
+                                          ctx->out[m] + (size_t)tok * (size_t)ctx->rows[m] + (size_t)r_base);
+                }
+                else
+                {
+                    float tmp[Q3_SPLITLUT_TILE_ROWS];
+                    q3_splitlut_tile_simd(tp, ctx->n_blk128, lb, valid, tmp);
+                    int lo = (start > r_base) ? (start - r_base) : 0;
+                    int hi = (end < r_base + valid) ? (end - r_base) : valid;
+                    float *dst = ctx->out[m] + (size_t)tok * (size_t)ctx->rows[m];
+                    for (int lr = lo; lr < hi; ++lr) dst[r_base + lr] = tmp[lr];
+                }
+            }
+        }
+    }
+}
+
+static void asi_e07_batch_worker(int tid, int n_threads, void *vctx)
+{
+    (void)tid;
+    AsiE07BatchCtx *ctx = (AsiE07BatchCtx *)vctx;
+    if (n_threads <= 1)
+    {
+        for (int m = 0; m < ctx->n_mats; ++m)
+            asi_e07_batch_eval_mat_range(ctx, m, 0, ctx->rows[m]);
+        if (ctx->apply_silu_mul && ctx->n_mats >= 2 && ctx->rows[0] == ctx->rows[1])
+        {
+            fast_silu_mul_vec(ctx->out[0], ctx->out[1],
+                              (uint32_t)((size_t)ctx->n_tokens * (size_t)ctx->rows[0]));
+        }
+        return;
+    }
+
+    if (ctx->apply_silu_mul && ctx->n_mats == 2 && ctx->rows[0] == ctx->rows[1] &&
+        ctx->quant_type[0] == ctx->quant_type[1])
+    {
+        int rows = ctx->rows[0];
+        int chunk = (ctx->quant_type[0] == ASI_QUANT_Q3_SPLITLUT) ? Q3_SPLITLUT_TILE_ROWS : 32;
+        for (;;)
+        {
+            int start = atomic_fetch_add_explicit(&ctx->next_row[0], chunk, memory_order_relaxed);
+            if (start >= rows) break;
+            int end = start + chunk;
+            if (end > rows) end = rows;
+            asi_e07_batch_eval_mat_range(ctx, 0, start, end);
+            asi_e07_batch_eval_mat_range(ctx, 1, start, end);
+            for (int t = 0; t < ctx->n_tokens; ++t)
+            {
+                size_t off = (size_t)t * (size_t)rows + (size_t)start;
+                fast_silu_mul_vec(ctx->out[0] + off, ctx->out[1] + off, (uint32_t)(end - start));
+            }
+        }
+        return;
+    }
+
+    for (int m = 0; m < ctx->n_mats; ++m)
+    {
+        int rows = ctx->rows[m];
+        int chunk = (ctx->quant_type[m] == ASI_QUANT_Q3_SPLITLUT) ? Q3_SPLITLUT_TILE_ROWS : 32;
+        for (;;)
+        {
+            int start = atomic_fetch_add_explicit(&ctx->next_row[m], chunk, memory_order_relaxed);
+            if (start >= rows) break;
+            int end = start + chunk;
+            if (end > rows) end = rows;
+            asi_e07_batch_eval_mat_range(ctx, m, start, end);
+        }
+    }
+}
+
+static int matmul_batch_e07_pool(AsiThreadPool *pool,
+                                 const AsiV2Cartridge *cart,
+                                 const AsiV2TensorEntry **ts,
+                                 float **outs,
+                                 int n_mats,
+                                 const float *in,
+                                 int n_tokens,
+                                 int cols,
+                                 int apply_silu_mul)
+{
+    int any_q4r = 0, any_q3 = 0;
+    for (int m = 0; m < n_mats; ++m)
+    {
+        if (ts[m]->quant_type == ASI_QUANT_Q4_REPACK) any_q4r = 1;
+        else if (ts[m]->quant_type == ASI_QUANT_Q3_SPLITLUT) any_q3 = 1;
+    }
+    int n_blk64 = (cols + Q4_REPACK_GROUP_SIZE - 1) / Q4_REPACK_GROUP_SIZE;
+    int n_blk128 = (cols + Q3_SPLITLUT_BLK_COLS - 1) / Q3_SPLITLUT_BLK_COLS;
+
+    LilaQ8_64Block stack_qx[128];
+    LilaQ8_64Block *qx_all = NULL;
+    LilaQ3LutBlock *q3_luts = NULL;
+
+    if (any_q4r)
+    {
+        size_t need = (size_t)n_tokens * (size_t)n_blk64;
+        qx_all = (need <= 128u) ? stack_qx : lila_q8_64_alloc(need);
+        if (!qx_all) return -1;
+        quantize_batch_q8_64_pool(pool, qx_all, in, n_tokens, cols);
+    }
+    if (any_q3)
+    {
+        size_t need_l = (size_t)n_tokens * (size_t)n_blk128;
+        q3_luts = (LilaQ3LutBlock *)asi_aligned_alloc(32, need_l * sizeof(LilaQ3LutBlock));
+        if (!q3_luts) { if (qx_all && qx_all != stack_qx) lila_q8_64_free(qx_all); return -1; }
+        for (int tok = 0; tok < n_tokens; ++tok)
+        {
+            q3_splitlut_build_lut(q3_luts + (size_t)tok * (size_t)n_blk128,
+                                  in + (size_t)tok * (size_t)cols, cols);
+        }
+    }
+
+    AsiE07BatchCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.n_mats = n_mats;
+    ctx.qx_all = qx_all;
+    ctx.q3_luts = q3_luts;
+    ctx.n_tokens = n_tokens;
+    ctx.n_blk64 = n_blk64;
+    ctx.n_blk128 = n_blk128;
+    ctx.apply_silu_mul = apply_silu_mul;
+    int max_rows = 0;
+    for (int m = 0; m < n_mats; ++m)
+    {
+        ctx.w[m] = tensor_data(cart, ts[m]);
+        ctx.out[m] = outs[m];
+        ctx.rows[m] = (int)ts[m]->shape[1];
+        ctx.quant_type[m] = ts[m]->quant_type;
+        atomic_init(&ctx.next_row[m], 0);
+        if (ctx.rows[m] > max_rows) max_rows = ctx.rows[m];
+    }
+    if (pool && (max_rows >= 16 || n_mats > 1))
+        asi_pool_run(pool, asi_e07_batch_worker, &ctx);
+    else
+        asi_e07_batch_worker(0, 1, &ctx);
+
+    if (qx_all && qx_all != stack_qx) lila_q8_64_free(qx_all);
+    if (q3_luts) asi_aligned_free(q3_luts);
+    return 0;
+}
+
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+/* BLIS L1 K-panel ceiling (256 x 16 x 4B = 16 KiB, fits cleanly in 32 KiB L1d) */
+#define ASI_BLIS_KC_BLOCK 256
+
+static inline void asi_dequant_q6k_16rows_blk(const uint8_t *w_q6k,
+                                              size_t row_bytes,
+                                              int n_base,
+                                              int n_cnt,
+                                              int blk_idx,
+                                              float *Bp)
+{
+    if (n_cnt < 16)
+        memset(Bp, 0, 256u * 16u * sizeof(float));
+    for (int r = 0; r < n_cnt; ++r)
+    {
+        const uint8_t *blk = w_q6k + (size_t)(n_base + r) * row_bytes + (size_t)blk_idx * 210u;
+        const uint8_t *ql = blk;
+        const uint8_t *qh = blk + 128;
+        const int8_t  *sc = (const int8_t *)(blk + 192);
+        uint16_t d_raw;
+        memcpy(&d_raw, blk + 208, 2);
+        float d = _cvtsh_ss(d_raw);
+        for (int half = 0; half < 2; ++half)
+        {
+            const uint8_t *qlh = ql + half * 64;
+            const uint8_t *qhh = qh + half * 32;
+            const int8_t  *sch = sc + half * 8;
+            int base_k = half * 128;
+            for (int l = 0; l < 32; ++l)
+            {
+                int is = l >> 4;
+                float s0 = d * (float)sch[is + 0];
+                float s2 = d * (float)sch[is + 2];
+                float s4 = d * (float)sch[is + 4];
+                float s6 = d * (float)sch[is + 6];
+                Bp[(base_k + l +  0) * 16 + r] = s0 * (float)((int)((qlh[l +  0] & 0x0Fu) | (((qhh[l] >> 0) & 3u) << 4)) - 32);
+                Bp[(base_k + l + 32) * 16 + r] = s2 * (float)((int)((qlh[l + 32] & 0x0Fu) | (((qhh[l] >> 2) & 3u) << 4)) - 32);
+                Bp[(base_k + l + 64) * 16 + r] = s4 * (float)((int)((qlh[l +  0] >>   4)  | (((qhh[l] >> 4) & 3u) << 4)) - 32);
+                Bp[(base_k + l + 96) * 16 + r] = s6 * (float)((int)((qlh[l + 32] >>   4)  | (((qhh[l] >> 6) & 3u) << 4)) - 32);
+            }
+        }
+    }
+}
+
+static inline void asi_dequant_q4r_16rows_blk(const uint8_t *w_q4r,
+                                              size_t row_bytes,
+                                              int n_base,
+                                              int n_cnt,
+                                              int blk256_idx,
+                                              int kc,
+                                              float *Bp)
+{
+    if (n_cnt < 16)
+        memset(Bp, 0, (size_t)kc * 16u * sizeof(float));
+    int n_sub = (kc + Q4_REPACK_GROUP_SIZE - 1) / Q4_REPACK_GROUP_SIZE;
+    for (int r = 0; r < n_cnt; ++r)
+    {
+        const uint8_t *row_blk0 = w_q4r + (size_t)(n_base + r) * row_bytes +
+                                  (size_t)blk256_idx * 4u * Q4_REPACK_BLOCK_SIZE;
+        for (int sb = 0; sb < n_sub; ++sb)
+        {
+            const uint8_t *blk = row_blk0 + (size_t)sb * Q4_REPACK_BLOCK_SIZE;
+            uint16_t d_raw;
+            memcpy(&d_raw, blk, 2);
+            float d = _cvtsh_ss(d_raw);
+            const uint8_t *qs = blk + 2;
+            int base_k = sb * Q4_REPACK_GROUP_SIZE;
+            int avail = kc - base_k;
+            if (avail > Q4_REPACK_GROUP_SIZE) avail = Q4_REPACK_GROUP_SIZE;
+            if (avail == Q4_REPACK_GROUP_SIZE)
+            {
+                for (int l = 0; l < 32; ++l)
+                {
+                    Bp[(base_k + l +  0) * 16 + r] = d * (float)((int)(qs[l] & 0x0Fu) - 8);
+                    Bp[(base_k + l + 32) * 16 + r] = d * (float)((int)(qs[l] >> 4) - 8);
+                }
+            }
+            else
+            {
+                for (int l = 0; l < 32; ++l)
+                {
+                    if (l < avail) Bp[(base_k + l) * 16 + r] = d * (float)((int)(qs[l] & 0x0Fu) - 8);
+                    if (l + 32 < avail) Bp[(base_k + l + 32) * 16 + r] = d * (float)((int)(qs[l] >> 4) - 8);
+                }
+            }
+        }
+    }
+}
+
+static inline void asi_dequant_q3_16rows_blk(const uint8_t *w_q3,
+                                             int n_blk128,
+                                             int n_base,
+                                             int n_cnt,
+                                             int blk128_idx,
+                                             int kc,
+                                             float *Bp)
+{
+    if (n_cnt < 16)
+        memset(Bp, 0, (size_t)kc * 16u * sizeof(float));
+    int tile = n_base / Q3_SPLITLUT_TILE_ROWS;
+    const uint8_t *bp_h = w_q3 + ((size_t)tile * (size_t)n_blk128 + (size_t)blk128_idx) * Q3_SPLITLUT_BLK_BYTES;
+    const uint8_t *bp_l = bp_h + Q3_SPLITLUT_BLK_HI2_BYTES;
+    const uint16_t *sp  = (const uint16_t *)(bp_l + Q3_SPLITLUT_BLK_LO1_BYTES);
+    for (int r = 0; r < n_cnt; ++r)
+    {
+        int lr = (n_base & 63) + r;
+        int bo = lr & 31;
+        int sh = (lr >= 32) ? 4 : 0;
+        uint16_t sc_raw;
+        memcpy(&sc_raw, sp + lr, 2);
+        float step = _cvtsh_ss(sc_raw);
+        for (int k = 0; k < kc; ++k)
+        {
+            uint8_t nib_h = (uint8_t)((bp_h[(size_t)(k >> 1) * 32u + (size_t)bo] >> sh) & 0x0Fu);
+            uint8_t hi2 = (k & 1) ? (uint8_t)((nib_h >> 2) & 0x03u) : (uint8_t)(nib_h & 0x03u);
+            uint8_t nib_l = (uint8_t)((bp_l[(size_t)(k >> 2) * 32u + (size_t)bo] >> sh) & 0x0Fu);
+            uint8_t lo1 = (uint8_t)((nib_l >> (k & 3)) & 0x01u);
+            Bp[k * 16 + r] = step * ((float)(((int)hi2 << 1) | (int)lo1) - 3.5f);
+        }
+    }
+}
+
+static inline void asi_kernel_6x16_f32_avx2(int kc,
+                                            const float *a0, const float *a1, const float *a2,
+                                            const float *a3, const float *a4, const float *a5,
+                                            const float *Bp,
+                                            float *c0, float *c1, float *c2,
+                                            float *c3, float *c4, float *c5,
+                                            float beta, int n_cnt)
+{
+    __m256 r00, r01, r10, r11, r20, r21, r30, r31, r40, r41, r50, r51;
+    if (beta == 0.0f)
+    {
+        r00 = _mm256_setzero_ps(); r01 = _mm256_setzero_ps();
+        r10 = _mm256_setzero_ps(); r11 = _mm256_setzero_ps();
+        r20 = _mm256_setzero_ps(); r21 = _mm256_setzero_ps();
+        r30 = _mm256_setzero_ps(); r31 = _mm256_setzero_ps();
+        r40 = _mm256_setzero_ps(); r41 = _mm256_setzero_ps();
+        r50 = _mm256_setzero_ps(); r51 = _mm256_setzero_ps();
+    }
+    else if (n_cnt == 16)
+    {
+        r00 = _mm256_loadu_ps(c0); r01 = _mm256_loadu_ps(c0 + 8);
+        r10 = _mm256_loadu_ps(c1); r11 = _mm256_loadu_ps(c1 + 8);
+        r20 = _mm256_loadu_ps(c2); r21 = _mm256_loadu_ps(c2 + 8);
+        r30 = _mm256_loadu_ps(c3); r31 = _mm256_loadu_ps(c3 + 8);
+        r40 = _mm256_loadu_ps(c4); r41 = _mm256_loadu_ps(c4 + 8);
+        r50 = _mm256_loadu_ps(c5); r51 = _mm256_loadu_ps(c5 + 8);
+    }
+    else
+    {
+        _Alignas(32) float tmp_in[16] = {0};
+        float *cs[6] = {c0, c1, c2, c3, c4, c5};
+        __m256 tlo[6], thi[6];
+        for (int i = 0; i < 6; ++i)
+        {
+            memcpy(tmp_in, cs[i], (size_t)n_cnt * sizeof(float));
+            tlo[i] = _mm256_load_ps(tmp_in);
+            thi[i] = _mm256_load_ps(tmp_in + 8);
+        }
+        r00 = tlo[0]; r01 = thi[0]; r10 = tlo[1]; r11 = thi[1]; r20 = tlo[2]; r21 = thi[2];
+        r30 = tlo[3]; r31 = thi[3]; r40 = tlo[4]; r41 = thi[4]; r50 = tlo[5]; r51 = thi[5];
+    }
+
+    for (int k = 0; k < kc; ++k)
+    {
+        __m256 b0 = _mm256_load_ps(Bp + k * 16);
+        __m256 b1 = _mm256_load_ps(Bp + k * 16 + 8);
+        __m256 va;
+        va = _mm256_broadcast_ss(a0 + k); r00 = _mm256_fmadd_ps(va, b0, r00); r01 = _mm256_fmadd_ps(va, b1, r01);
+        va = _mm256_broadcast_ss(a1 + k); r10 = _mm256_fmadd_ps(va, b0, r10); r11 = _mm256_fmadd_ps(va, b1, r11);
+        va = _mm256_broadcast_ss(a2 + k); r20 = _mm256_fmadd_ps(va, b0, r20); r21 = _mm256_fmadd_ps(va, b1, r21);
+        va = _mm256_broadcast_ss(a3 + k); r30 = _mm256_fmadd_ps(va, b0, r30); r31 = _mm256_fmadd_ps(va, b1, r31);
+        va = _mm256_broadcast_ss(a4 + k); r40 = _mm256_fmadd_ps(va, b0, r40); r41 = _mm256_fmadd_ps(va, b1, r41);
+        va = _mm256_broadcast_ss(a5 + k); r50 = _mm256_fmadd_ps(va, b0, r50); r51 = _mm256_fmadd_ps(va, b1, r51);
+    }
+
+    if (n_cnt == 16)
+    {
+        _mm256_storeu_ps(c0, r00); _mm256_storeu_ps(c0 + 8, r01);
+        _mm256_storeu_ps(c1, r10); _mm256_storeu_ps(c1 + 8, r11);
+        _mm256_storeu_ps(c2, r20); _mm256_storeu_ps(c2 + 8, r21);
+        _mm256_storeu_ps(c3, r30); _mm256_storeu_ps(c3 + 8, r31);
+        _mm256_storeu_ps(c4, r40); _mm256_storeu_ps(c4 + 8, r41);
+        _mm256_storeu_ps(c5, r50); _mm256_storeu_ps(c5 + 8, r51);
+    }
+    else
+    {
+        _Alignas(32) float tmp_out[16];
+        float *cs[6] = {c0, c1, c2, c3, c4, c5};
+        __m256 slo[6] = {r00, r10, r20, r30, r40, r50};
+        __m256 shi[6] = {r01, r11, r21, r31, r41, r51};
+        for (int i = 0; i < 6; ++i)
+        {
+            _mm256_store_ps(tmp_out, slo[i]);
+            _mm256_store_ps(tmp_out + 8, shi[i]);
+            memcpy(cs[i], tmp_out, (size_t)n_cnt * sizeof(float));
+        }
+    }
+}
+
+static void asi_blis_6x16_range(float *out,
+                                const uint8_t *w,
+                                uint32_t quant_type,
+                                const float *in,
+                                int n_tokens,
+                                int start,
+                                int end,
+                                int rows,
+                                int cols)
+{
+    int k_step = (quant_type == ASI_QUANT_Q3_SPLITLUT) ? Q3_SPLITLUT_BLK_COLS : ASI_BLIS_KC_BLOCK;
+    int bpr = (cols + k_step - 1) / k_step;
+    size_t row_bytes = (quant_type == 14u)
+                           ? ((size_t)bpr * 210u)
+                           : lila_quant_row_bytes(quant_type, cols, 0);
+    int n_blk128 = (cols + Q3_SPLITLUT_BLK_COLS - 1) / Q3_SPLITLUT_BLK_COLS;
+    _Alignas(32) float Bp[ASI_BLIS_KC_BLOCK * 16];
+
+    for (int r = start; r < end; r += 16)
+    {
+        int n_cnt = (r + 16 <= end) ? 16 : (end - r);
+        for (int b = 0; b < bpr; ++b)
+        {
+            size_t k_off = (size_t)b * (size_t)k_step;
+            int kc = cols - (int)k_off;
+            if (kc > k_step) kc = k_step;
+
+            if (quant_type == 14u)
+                asi_dequant_q6k_16rows_blk(w, row_bytes, r, n_cnt, b, Bp);
+            else if (quant_type == ASI_QUANT_Q4_REPACK)
+                asi_dequant_q4r_16rows_blk(w, row_bytes, r, n_cnt, b, kc, Bp);
+            else
+                asi_dequant_q3_16rows_blk(w, n_blk128, r, n_cnt, b, kc, Bp);
+
+            float beta = (b == 0) ? 0.0f : 1.0f;
+            int t = 0;
+            for (; t + 5 < n_tokens; t += 6)
+            {
+                asi_kernel_6x16_f32_avx2(
+                    kc,
+                    in + (size_t)(t + 0) * cols + k_off,
+                    in + (size_t)(t + 1) * cols + k_off,
+                    in + (size_t)(t + 2) * cols + k_off,
+                    in + (size_t)(t + 3) * cols + k_off,
+                    in + (size_t)(t + 4) * cols + k_off,
+                    in + (size_t)(t + 5) * cols + k_off,
+                    Bp,
+                    out + (size_t)(t + 0) * rows + r,
+                    out + (size_t)(t + 1) * rows + r,
+                    out + (size_t)(t + 2) * rows + r,
+                    out + (size_t)(t + 3) * rows + r,
+                    out + (size_t)(t + 4) * rows + r,
+                    out + (size_t)(t + 5) * rows + r,
+                    beta, n_cnt);
+            }
+            for (; t < n_tokens; ++t)
+            {
+                float *ct = out + (size_t)t * rows + r;
+                const float *at = in + (size_t)t * cols + k_off;
+                __m256 r0, r1;
+                if (beta == 0.0f)
+                {
+                    r0 = _mm256_setzero_ps();
+                    r1 = _mm256_setzero_ps();
+                }
+                else if (n_cnt == 16)
+                {
+                    r0 = _mm256_loadu_ps(ct);
+                    r1 = _mm256_loadu_ps(ct + 8);
+                }
+                else
+                {
+                    _Alignas(32) float tmp_in[16] = {0};
+                    memcpy(tmp_in, ct, (size_t)n_cnt * sizeof(float));
+                    r0 = _mm256_load_ps(tmp_in);
+                    r1 = _mm256_load_ps(tmp_in + 8);
+                }
+                for (int k = 0; k < kc; ++k)
+                {
+                    __m256 va = _mm256_broadcast_ss(at + k);
+                    r0 = _mm256_fmadd_ps(va, _mm256_load_ps(Bp + k * 16), r0);
+                    r1 = _mm256_fmadd_ps(va, _mm256_load_ps(Bp + k * 16 + 8), r1);
+                }
+                if (n_cnt == 16)
+                {
+                    _mm256_storeu_ps(ct, r0);
+                    _mm256_storeu_ps(ct + 8, r1);
+                }
+                else
+                {
+                    _Alignas(32) float tmp_out[16];
+                    _mm256_store_ps(tmp_out, r0);
+                    _mm256_store_ps(tmp_out + 8, r1);
+                    memcpy(ct, tmp_out, (size_t)n_cnt * sizeof(float));
+                }
+            }
+        }
+    }
+}
+
+typedef struct {
+    const uint8_t *w[4];
+    float *out[4];
+    int rows[4];
+    uint32_t quant_type[4];
+    int n_mats;
+    const float *in;
+    int n_tokens;
+    int cols;
+    int apply_silu_mul;
+    _Alignas(64) atomic_int next_row[4];
+} AsiBlisCtx;
+
+static void asi_blis_worker(int tid, int n_threads, void *vctx)
+{
+    (void)tid;
+    AsiBlisCtx *ctx = (AsiBlisCtx *)vctx;
+    if (n_threads <= 1)
+    {
+        for (int m = 0; m < ctx->n_mats; ++m)
+        {
+            asi_blis_6x16_range(ctx->out[m], ctx->w[m], ctx->quant_type[m], ctx->in,
+                                ctx->n_tokens, 0, ctx->rows[m], ctx->rows[m], ctx->cols);
+        }
+        if (ctx->apply_silu_mul && ctx->n_mats == 2)
+        {
+            fast_silu_mul_vec(ctx->out[0], ctx->out[1],
+                              (uint32_t)((size_t)ctx->n_tokens * (size_t)ctx->rows[0]));
+        }
+        return;
+    }
+
+    if (ctx->apply_silu_mul && ctx->n_mats == 2 && ctx->rows[0] == ctx->rows[1])
+    {
+        int rows = ctx->rows[0];
+        int chunk = (rows >= 256) ? 32 : 16;
+        for (;;)
+        {
+            int start = atomic_fetch_add_explicit(&ctx->next_row[0], chunk, memory_order_relaxed);
+            if (start >= rows) break;
+            int end = start + chunk;
+            if (end > rows) end = rows;
+            asi_blis_6x16_range(ctx->out[0], ctx->w[0], ctx->quant_type[0], ctx->in,
+                                ctx->n_tokens, start, end, rows, ctx->cols);
+            asi_blis_6x16_range(ctx->out[1], ctx->w[1], ctx->quant_type[1], ctx->in,
+                                ctx->n_tokens, start, end, rows, ctx->cols);
+            for (int t = 0; t < ctx->n_tokens; ++t)
+            {
+                size_t off = (size_t)t * (size_t)rows + (size_t)start;
+                fast_silu_mul_vec(ctx->out[0] + off, ctx->out[1] + off, (uint32_t)(end - start));
+            }
+        }
+        return;
+    }
+
+    for (int m = 0; m < ctx->n_mats; ++m)
+    {
+        int rows = ctx->rows[m];
+        int chunk = (rows >= 256) ? 32 : 16;
+        for (;;)
+        {
+            int start = atomic_fetch_add_explicit(&ctx->next_row[m], chunk, memory_order_relaxed);
+            if (start >= rows) break;
+            int end = start + chunk;
+            if (end > rows) end = rows;
+            asi_blis_6x16_range(ctx->out[m], ctx->w[m], ctx->quant_type[m], ctx->in,
+                                ctx->n_tokens, start, end, rows, ctx->cols);
+        }
+    }
+}
+
+#endif /* __AVX2__ && __FMA__ && __F16C__ */
+
+static int matmul_batch_tensor(AsiThreadPool *pool,
+                               const AsiV2Cartridge *cart,
+                               const AsiV2TensorEntry *t,
+                               float *out,
+                               const float *in,
+                               int n_tokens,
+                               int fp32_ref)
+{
+    const uint8_t *w = tensor_data(cart, t);
+    int cols = (int)t->shape[0];
+    int rows = (int)t->shape[1];
+    if (n_tokens <= 1)
+    {
+        return matvec_tensor_pool(pool, cart, t, out, in, fp32_ref);
+    }
+    if (fp32_ref)
+    {
+        return matmul_fp32_pool(pool, cart, &t, &out, 1, in, n_tokens, cols, 0);
+    }
+    if ((t->quant_type == ASI_QUANT_Q4_REPACK && !(t->layout_flags & ASI_TENSOR_LAYOUT_COL_MAJOR)) ||
+        t->quant_type == ASI_QUANT_Q3_SPLITLUT)
+    {
+        return matmul_batch_e07_pool(pool, cart, &t, &out, 1, in, n_tokens, cols, 0);
+    }
+    if (t->quant_type == ASI_QUANT_Q4_REPACK && (t->layout_flags & ASI_TENSOR_LAYOUT_COL_MAJOR))
+    {
+        for (int tok = 0; tok < n_tokens; ++tok)
+        {
+            matvec_q4_col_major_pool(pool, cart, t, out + (size_t)tok * rows, in + (size_t)tok * cols, 1.0f);
+        }
+        return 0;
+    }
+    if ((t->quant_type == 12 || t->quant_type == 14) && !(t->layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK))
+    {
+        int bpr = (cols + QK_K - 1) / QK_K;
+        if (bpr <= 0) return 0;
+        size_t need = (size_t)n_tokens * (size_t)bpr;
+        LilaQ8KBlock stack_qx[256];
+        LilaQ8KBlock *qx_all = (need <= 256) ? stack_qx : lila_q8k_alloc(need);
+        if (qx_all)
+        {
+            if (qx_all == stack_qx) memset(stack_qx, 0, need * sizeof(LilaQ8KBlock));
+            for (int tok = 0; tok < n_tokens; ++tok)
+            {
+                quantize_vec_q8k_strided(qx_all + tok, n_tokens, in + (size_t)tok * cols, cols);
+            }
+            matmul_batch_q8k_pool(pool, cart, t, out, qx_all, n_tokens, bpr);
+            if (qx_all != stack_qx) free(qx_all);
+            return 0;
+        }
+    }
+    if (t->quant_type == 12) /* Q4_K */
+    {
+        q4k_matmul_batch(out, w, in, n_tokens, rows, cols);
+        return 0;
+    }
+    if (t->quant_type == 14) /* Q6_K */
+    {
+        if (t->layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK)
+            q6k_repacked_matmul_batch(out, w, in, n_tokens, rows, cols);
+        else
+            q6k_matmul_batch(out, w, in, n_tokens, rows, cols);
+        return 0;
+    }
+    if (lila_quant_is_supported(t->quant_type))
+    {
+        return matmul_fp32_pool(pool, cart, &t, &out, 1, in, n_tokens, cols, 0);
+    }
+    return -1;
+}
+
 static int matmul_batch_tensor_qx(AsiThreadPool *pool,
                                   const AsiV2Cartridge *cart,
                                   const AsiV2TensorEntry *t,
@@ -1084,6 +2024,35 @@ static int matmul_batch_tensor_qx(AsiThreadPool *pool,
     if (fp32_ref)
     {
         return matmul_fp32_pool(pool, cart, &t, &out, 1, in, n_tokens, (int)t->shape[0], 0);
+    }
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    if (in && n_tokens >= asi_runtime_config()->blis_min_tokens &&
+        asi_blis_prefill_enabled() && asi_cpu_has_avx2_fma_f16c() &&
+        asi_tensor_blis_supported(t))
+    {
+        AsiBlisCtx ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.w[0] = tensor_data(cart, t);
+        ctx.out[0] = out;
+        ctx.rows[0] = (int)t->shape[1];
+        ctx.quant_type[0] = t->quant_type;
+        ctx.n_mats = 1;
+        ctx.in = in;
+        ctx.n_tokens = n_tokens;
+        ctx.cols = (int)t->shape[0];
+        atomic_init(&ctx.next_row[0], 0);
+        if (pool && ctx.rows[0] >= 16)
+            asi_pool_run(pool, asi_blis_worker, &ctx);
+        else
+            asi_blis_worker(0, 1, &ctx);
+        return 0;
+    }
+#endif
+    if (n_tokens > 1 &&
+        ((t->quant_type == ASI_QUANT_Q4_REPACK && !(t->layout_flags & ASI_TENSOR_LAYOUT_COL_MAJOR)) ||
+         t->quant_type == ASI_QUANT_Q3_SPLITLUT))
+    {
+        return matmul_batch_e07_pool(pool, cart, &t, &out, 1, in, n_tokens, (int)t->shape[0], 0);
     }
     if (qx_all && n_tokens > 1 && (t->quant_type == 12 || t->quant_type == 14) &&
         !(t->layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK))
@@ -1184,7 +2153,77 @@ static int matmul_batch_fused_q8k_pool(AsiThreadPool *pool,
     {
         return matmul_fp32_pool(pool, cart, ts, outs, n_mats, in, n_tokens, (int)ts[0]->shape[0], apply_silu_mul);
     }
-    if (n_tokens <= 1 || !qx_all)
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    if (in && n_tokens >= asi_runtime_config()->blis_min_tokens && n_mats >= 1 && n_mats <= 4 &&
+        asi_blis_prefill_enabled() && asi_cpu_has_avx2_fma_f16c())
+    {
+        int all_blis = 1;
+        for (int m = 0; m < n_mats; ++m)
+        {
+            if (!asi_tensor_blis_supported(ts[m]) ||
+                (int)ts[m]->shape[0] != (int)ts[0]->shape[0])
+            {
+                all_blis = 0;
+                break;
+            }
+        }
+        if (all_blis)
+        {
+            AsiBlisCtx ctx;
+            memset(&ctx, 0, sizeof(ctx));
+            ctx.n_mats = n_mats;
+            ctx.in = in;
+            ctx.n_tokens = n_tokens;
+            ctx.cols = (int)ts[0]->shape[0];
+            ctx.apply_silu_mul = apply_silu_mul;
+            for (int m = 0; m < n_mats; ++m)
+            {
+                ctx.w[m] = tensor_data(cart, ts[m]);
+                ctx.out[m] = outs[m];
+                ctx.rows[m] = (int)ts[m]->shape[1];
+                ctx.quant_type[m] = ts[m]->quant_type;
+                atomic_init(&ctx.next_row[m], 0);
+            }
+            if (pool)
+                asi_pool_run(pool, asi_blis_worker, &ctx);
+            else
+                asi_blis_worker(0, 1, &ctx);
+            return 0;
+        }
+    }
+#endif
+    if (n_tokens <= 1)
+    {
+        for (int m = 0; m < n_mats; ++m)
+        {
+            if (matmul_batch_tensor(pool, cart, ts[m], outs[m], in, n_tokens, 0) != 0)
+                return -1;
+        }
+        if (apply_silu_mul && n_mats >= 2)
+            fast_silu_mul_vec(outs[0], outs[1], (uint32_t)((size_t)n_tokens * (size_t)ts[0]->shape[1]));
+        return 0;
+    }
+    {
+        int all_e07_rm = 1;
+        for (int m = 0; m < n_mats; ++m)
+        {
+            uint32_t qt = ts[m]->quant_type;
+            uint32_t lf = ts[m]->layout_flags;
+            if (!((qt == ASI_QUANT_Q4_REPACK && !(lf & ASI_TENSOR_LAYOUT_COL_MAJOR)) ||
+                  qt == ASI_QUANT_Q3_SPLITLUT) ||
+                (int)ts[m]->shape[0] != (int)ts[0]->shape[0])
+            {
+                all_e07_rm = 0;
+                break;
+            }
+        }
+        if (all_e07_rm)
+        {
+            return matmul_batch_e07_pool(pool, cart, ts, outs, n_mats, in, n_tokens,
+                                         (int)ts[0]->shape[0], apply_silu_mul);
+        }
+    }
+    if (!qx_all)
     {
         for (int m = 0; m < n_mats; ++m)
         {
@@ -1272,6 +2311,72 @@ static void apply_rope_neox_partial(float *vec, uint32_t rope_dim, uint32_t pos,
     {
         float freq = inv_freq ? inv_freq[i] : (1.0f / powf(theta, (float)(2 * i) / (float)rope_dim));
         float angle = (float)pos * freq;
+        float c = cosf(angle);
+        float s = sinf(angle);
+        float x0 = vec[i];
+        float x1 = vec[i + half];
+        vec[i] = x0 * c - x1 * s;
+        vec[i + half] = x0 * s + x1 * c;
+    }
+}
+
+static inline uint32_t asi_effective_rope_pos(int64_t delta, uint32_t kv_pos)
+{
+    int64_t r = (int64_t)kv_pos + delta;
+    return (r > 0) ? (uint32_t)r : 0u;
+}
+
+static void apply_rope_neox_3d(float *vec,
+                               uint32_t rope_dim,
+                               uint32_t pos_t,
+                               uint32_t pos_h,
+                               uint32_t pos_w,
+                               const uint32_t sections[3],
+                               uint32_t flags,
+                               float theta,
+                               const float *inv_freq)
+{
+    if (pos_t == pos_h && pos_h == pos_w)
+    {
+        apply_rope_neox_partial(vec, rope_dim, pos_t, theta, inv_freq);
+        return;
+    }
+    uint32_t half = rope_dim / 2u;
+    uint32_t sec[3];
+    if (sections && (sections[0] + sections[1] + sections[2]) > 0u)
+    {
+        sec[0] = sections[0];
+        sec[1] = sections[1];
+        sec[2] = sections[2];
+    }
+    else if (half == 32u)
+    {
+        sec[0] = 11u;
+        sec[1] = 11u;
+        sec[2] = 10u;
+    }
+    else
+    {
+        sec[0] = half / 3u;
+        sec[1] = half / 3u;
+        sec[2] = half - sec[0] - sec[1];
+    }
+    for (uint32_t i = 0; i < half; ++i)
+    {
+        uint32_t p;
+        if (flags & LILA_ASI_MROPE_INTERLEAVED)
+        {
+            p = pos_t;
+            uint32_t mod3 = i % 3u;
+            if (mod3 == 1u && i < sec[1] * 3u) p = pos_h;
+            else if (mod3 == 2u && i < sec[2] * 3u) p = pos_w;
+        }
+        else
+        {
+            p = (i < sec[0]) ? pos_t : ((i < sec[0] + sec[1]) ? pos_h : pos_w);
+        }
+        float freq = inv_freq ? inv_freq[i] : (1.0f / powf(theta, (float)(2u * i) / (float)rope_dim));
+        float angle = (float)p * freq;
         float c = cosf(angle);
         float s = sinf(angle);
         float x0 = vec[i];
@@ -1403,7 +2508,7 @@ static void qwen35_free_session(AsiArchSession *s)
     free(s->scratch.aob);
     free(s->scratch.fgb);
     free(s->scratch.fub);
-    free(s->scratch.qx_h);
+    asi_aligned_free(s->scratch.qx_h);
     free(s->scratch.thread_scores_blk);
     free(s);
 }
@@ -1463,8 +2568,10 @@ static void qwen35_reset_state(AsiArchSession *s)
     s->history_valid_from = 0;
     s->prompt_len = 0;
     s->kv_dirty_from = 0;
+    s->mrope_pos_delta = 0;
     s->spec_consec_misses = 0;
     s->spec_cooldown = 0;
+    s->mrope_pos_delta = 0;
     s->fail_gen++;
     if (s->fail_gen == 0)
     {
@@ -1504,6 +2611,7 @@ static int qwen35_init_session(const AsiV2Cartridge *cart,
     const char *preset_env = getenv("LILA_ASI_MODE");
     int preset_spec = cfg->speculative;
     int preset_spec_gate = 1;
+    float preset_sparse_keep = 0.5f;
     LilaLhcMode preset_lhm = (!s->fp32_ref && cart->config.vocab_size > 4096u && cart->config.hidden_size == 1024u)
                                  ? LILA_LHC_MODE_1BIT_1024
                                  : LILA_LHC_MODE_OFF;
@@ -1518,6 +2626,7 @@ static int qwen35_init_session(const AsiV2Cartridge *cart,
             preset_k = 1024;
             preset_spec = 1;
             preset_spec_gate = 1;
+            preset_sparse_keep = 1.0f;
         }
         else if (strcasecmp(preset_env, "exact") == 0)
         {
@@ -1525,8 +2634,13 @@ static int qwen35_init_session(const AsiV2Cartridge *cart,
             preset_k = 2048;
             preset_spec = 0;
             preset_spec_gate = 0;
+            preset_sparse_keep = 1.0f;
         }
     }
+    const char *sk_env = getenv("LILA_ASI_FFN_SPARSE_KEEP");
+    s->ffn_sparse_keep = (sk_env && sk_env[0] != '\0') ? (float)atof(sk_env) : preset_sparse_keep;
+    if (s->ffn_sparse_keep <= 0.0f) s->ffn_sparse_keep = preset_sparse_keep;
+    if (s->ffn_sparse_keep > 1.0f) s->ffn_sparse_keep = 1.0f;
     s->speculative = asi_env_int("LILA_ASI_SPECULATIVE", preset_spec, 0, NULL) ? 1 : 0;
     int sdl = asi_env_int("LILA_ASI_SPEC_DRAFT_LEN", cfg->spec_draft_len, 1, NULL);
     if (sdl > (int)ASI_SPEC_MAX_K) sdl = (int)ASI_SPEC_MAX_K;
@@ -1637,6 +2751,10 @@ static int qwen35_init_session(const AsiV2Cartridge *cart,
             qwen35_free_session(s);
             return -1;
         }
+        if (lw->ffn_gate->quant_type == ASI_QUANT_Q4_REPACK || lw->ffn_down->quant_type == ASI_QUANT_Q4_REPACK)
+        {
+            s->has_q4_repack = 1;
+        }
 
         if (lw->kind == QWEN35_LAYER_DELTANET)
         {
@@ -1721,12 +2839,23 @@ static int qwen35_init_session(const AsiV2Cartridge *cart,
         {
             int lm_repacked = (lm_head->layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK) ? 1 : 0;
             if (s->lmhead_k > c->vocab_size) s->lmhead_k = c->vocab_size;
-            asi_pool_begin(s->pool);
-            s->lmhead_idx = lila_lhc_build_quant_pool(
-                s->lmhead_mode, tensor_data(cart, lm_head), lm_head->quant_type, lm_repacked,
-                c->vocab_size, c->hidden_size,
-                (const float *)tensor_data(cart, s->output_norm), lhc_asi_dispatch, s->pool);
-            asi_pool_end(s->pool);
+            const AsiV2SectionEntry *sv = asi_v2_find_section(cart, ASI_SEC_SIEVE_SKETCH);
+            if (sv && cart->base && sv->offset <= (uint64_t)cart->file_size &&
+                sv->size <= (uint64_t)cart->file_size - sv->offset)
+            {
+                s->lmhead_idx = lila_lhc_from_serialized(
+                    s->lmhead_mode, cart->base + sv->offset, (size_t)sv->size,
+                    lm_head->quant_type, lm_repacked, c->vocab_size, c->hidden_size);
+            }
+            if (!s->lmhead_idx)
+            {
+                asi_pool_begin(s->pool);
+                s->lmhead_idx = lila_lhc_build_quant_pool(
+                    s->lmhead_mode, tensor_data(cart, lm_head), lm_head->quant_type, lm_repacked,
+                    c->vocab_size, c->hidden_size,
+                    (const float *)tensor_data(cart, s->output_norm), lhc_asi_dispatch, s->pool);
+                asi_pool_end(s->pool);
+            }
             s->lmhead_ws = lila_lhc_workspace_create(
                 c->vocab_size, s->lmhead_k, s->n_threads, 1u + ASI_SPEC_MAX_K);
             if (!s->lmhead_idx || !s->lmhead_ws)
@@ -2226,6 +3355,191 @@ typedef struct {
     _Alignas(64) atomic_int next_h;
 } AsiDeltaNetCtx;
 
+static inline int asi_chunkwy_enabled(void)
+{
+    const char *e = getenv("LILA_ASI_CHUNKWY");
+    return (!e || e[0] != '0') ? 1 : 0;
+}
+
+static void asi_sgemm_rm(int M, int N, int K,
+                         const float *A, int lda,
+                         const float *B, int ldb,
+                         float beta,
+                         float *C, int ldc)
+{
+    if (beta != 0.0f && beta != 1.0f)
+    {
+        for (int i = 0; i < M; ++i)
+        {
+            float *ci = C + (size_t)i * ldc;
+            for (int j = 0; j < N; ++j) ci[j] *= beta;
+        }
+    }
+    const float k_beta = (beta == 0.0f) ? 0.0f : 1.0f;
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    _Alignas(32) float Bp[128 * 16];
+    for (int j0 = 0; j0 < N; j0 += 16)
+    {
+        int n_cnt = N - j0;
+        if (n_cnt > 16) n_cnt = 16;
+        if (n_cnt == 16)
+        {
+            for (int k = 0; k < K; ++k)
+                memcpy(Bp + (size_t)k * 16, B + (size_t)k * ldb + j0, 16 * sizeof(float));
+        }
+        else
+        {
+            for (int k = 0; k < K; ++k)
+            {
+                float *dst = Bp + (size_t)k * 16;
+                memcpy(dst, B + (size_t)k * ldb + j0, (size_t)n_cnt * sizeof(float));
+                for (int r = n_cnt; r < 16; ++r) dst[r] = 0.0f;
+            }
+        }
+        int i = 0;
+        for (; i + 5 < M; i += 6)
+        {
+            asi_kernel_6x16_f32_avx2(K,
+                                     A + (size_t)(i + 0) * lda, A + (size_t)(i + 1) * lda,
+                                     A + (size_t)(i + 2) * lda, A + (size_t)(i + 3) * lda,
+                                     A + (size_t)(i + 4) * lda, A + (size_t)(i + 5) * lda,
+                                     Bp,
+                                     C + (size_t)(i + 0) * ldc + j0, C + (size_t)(i + 1) * ldc + j0,
+                                     C + (size_t)(i + 2) * ldc + j0, C + (size_t)(i + 3) * ldc + j0,
+                                     C + (size_t)(i + 4) * ldc + j0, C + (size_t)(i + 5) * ldc + j0,
+                                     k_beta, n_cnt);
+        }
+        for (; i < M; ++i)
+        {
+            float tmp[16];
+            memset(tmp, 0, sizeof(tmp));
+            if (k_beta != 0.0f) memcpy(tmp, C + (size_t)i * ldc + j0, (size_t)n_cnt * sizeof(float));
+            __m256 c0 = _mm256_loadu_ps(tmp);
+            __m256 c1 = _mm256_loadu_ps(tmp + 8);
+            const float *ai = A + (size_t)i * lda;
+            for (int k = 0; k < K; ++k)
+            {
+                __m256 va = _mm256_broadcast_ss(ai + k);
+                c0 = _mm256_fmadd_ps(va, _mm256_load_ps(Bp + (size_t)k * 16), c0);
+                c1 = _mm256_fmadd_ps(va, _mm256_load_ps(Bp + (size_t)k * 16 + 8), c1);
+            }
+            _mm256_storeu_ps(tmp, c0);
+            _mm256_storeu_ps(tmp + 8, c1);
+            memcpy(C + (size_t)i * ldc + j0, tmp, (size_t)n_cnt * sizeof(float));
+        }
+    }
+#else
+    for (int i = 0; i < M; ++i)
+    {
+        const float *ai = A + (size_t)i * lda;
+        float *ci = C + (size_t)i * ldc;
+        if (k_beta == 0.0f) memset(ci, 0, (size_t)N * sizeof(float));
+        for (int k = 0; k < K; ++k)
+        {
+            float a = ai[k];
+            const float *bk = B + (size_t)k * ldb;
+            for (int j = 0; j < N; ++j) ci[j] += a * bk[j];
+        }
+    }
+#endif
+}
+
+typedef struct {
+    float S_T[128 * 128];
+    float KT[128 * 32];
+    float Gkk[32 * 32];
+    float Gqk[32 * 32];
+    float P[32 * 128];
+    float O_inter[32 * 128];
+    float RHS[32 * 128];
+    float U[32 * 128];
+    float Linv[32 * 32];
+    float A_mat[32 * 32];
+} AsiDeltaNetWyBuf;
+
+static int asi_deltanet_wy_chunk(AsiDeltaNetWyBuf *wb,
+                                 const float *Q_tile,
+                                 const float *K_tile,
+                                 const float *V_tile,
+                                 const float *log_g_arr,
+                                 const float *beta_arr,
+                                 float *O_tile,
+                                 uint32_t nt,
+                                 uint32_t k_dim,
+                                 uint32_t v_dim)
+{
+    int C = (int)nt;
+    int Kd = (int)k_dim;
+    int Vd = (int)v_dim;
+    float L[32], Gamma[32];
+    float acc_log = 0.0f;
+    for (int i = 0; i < C; ++i)
+    {
+        acc_log += log_g_arr[i];
+        if (!isfinite(acc_log)) return -1;
+        L[i] = acc_log;
+        Gamma[i] = expf(acc_log);
+    }
+    float L_end = L[C - 1];
+    float Gamma_end = Gamma[C - 1];
+
+    for (int j = 0; j < C; ++j)
+    {
+        const float *kj = K_tile + (size_t)j * Kd;
+        for (int k = 0; k < Kd; ++k) wb->KT[(size_t)k * C + j] = kj[k];
+    }
+
+    asi_sgemm_rm(C, C, Kd, K_tile, Kd, wb->KT, C, 0.0f, wb->Gkk, C);
+    asi_sgemm_rm(C, C, Kd, Q_tile, Kd, wb->KT, C, 0.0f, wb->Gqk, C);
+    asi_sgemm_rm(C, Vd, Kd, K_tile, Kd, wb->S_T, Vd, 0.0f, wb->P, Vd);
+    asi_sgemm_rm(C, Vd, Kd, Q_tile, Kd, wb->S_T, Vd, 0.0f, wb->O_inter, Vd);
+
+    for (int i = 0; i < C; ++i)
+    {
+        float bi = beta_arr[i];
+        float gi = Gamma[i];
+        const float *vi = V_tile + (size_t)i * Vd;
+        const float *pi = wb->P + (size_t)i * Vd;
+        float *ri = wb->RHS + (size_t)i * Vd;
+        for (int d = 0; d < Vd; ++d) ri[d] = bi * (vi[d] - gi * pi[d]);
+    }
+
+    memset(wb->Linv, 0, (size_t)C * C * sizeof(float));
+    for (int i = 0; i < C; ++i)
+    {
+        wb->Linv[i * C + i] = 1.0f;
+        float bi = beta_arr[i];
+        float li = L[i];
+        for (int k = 0; k < i; ++k)
+        {
+            float mik = bi * expf(li - L[k]) * wb->Gkk[i * C + k];
+            for (int j = 0; j <= k; ++j)
+                wb->Linv[i * C + j] -= mik * wb->Linv[k * C + j];
+        }
+    }
+    asi_sgemm_rm(C, Vd, C, wb->Linv, C, wb->RHS, Vd, 0.0f, wb->U, Vd);
+
+    for (int i = 0; i < C; ++i)
+    {
+        float gi = Gamma[i];
+        float li = L[i];
+        const float *oi = wb->O_inter + (size_t)i * Vd;
+        float *oo = O_tile + (size_t)i * Vd;
+        for (int d = 0; d < Vd; ++d) oo[d] = gi * oi[d];
+        for (int j = 0; j < C; ++j)
+            wb->A_mat[i * C + j] = (j <= i) ? (expf(li - L[j]) * wb->Gqk[i * C + j]) : 0.0f;
+    }
+    asi_sgemm_rm(C, Vd, C, wb->A_mat, C, wb->U, Vd, 1.0f, O_tile, Vd);
+
+    for (int j = 0; j < C; ++j)
+    {
+        float sc = expf(L_end - L[j]);
+        for (int k = 0; k < Kd; ++k) wb->KT[(size_t)k * C + j] *= sc;
+    }
+    asi_sgemm_rm(Kd, Vd, C, wb->KT, C, wb->U, Vd, Gamma_end, wb->S_T, Vd);
+    return 0;
+}
+
 static void asi_deltanet_worker(int tid, int n_threads, void *vctx)
 {
     (void)tid;
@@ -2233,6 +3547,112 @@ static void asi_deltanet_worker(int tid, int n_threads, void *vctx)
     uint32_t n_heads = ctx->n_heads;
     uint32_t k_dim = ctx->k_dim;
     uint32_t v_dim = ctx->v_dim;
+
+    if (!ctx->spec_keep_state && !ctx->state_only && ctx->B >= 32u &&
+        (k_dim & 7u) == 0u && k_dim <= 128u && v_dim <= 128u && asi_chunkwy_enabled())
+    {
+        AsiDeltaNetWyBuf *wb = (AsiDeltaNetWyBuf *)asi_aligned_alloc(32, sizeof(AsiDeltaNetWyBuf));
+        if (wb)
+        {
+            _Alignas(32) float Q_tile[4096];
+            _Alignas(32) float K_tile[4096];
+            _Alignas(32) float V_tile[4096];
+            _Alignas(32) float O_tile[4096];
+            float log_g_arr[32], g_arr[32], beta_arr[32];
+
+            for (uint32_t h_idx = 0;; )
+            {
+                uint32_t h;
+                if (n_threads <= 1)
+                {
+                    if (h_idx >= n_heads) break;
+                    h = h_idx++;
+                }
+                else
+                {
+                    h = (uint32_t)atomic_fetch_add_explicit(&ctx->next_h, 1, memory_order_relaxed);
+                    if (h >= n_heads) break;
+                }
+                float *S = ctx->ssm_state + (size_t)h * v_dim * k_dim;
+                for (uint32_t j = 0; j < v_dim; ++j)
+                    for (uint32_t k = 0; k < k_dim; ++k)
+                        wb->S_T[(size_t)k * v_dim + j] = S[(size_t)j * k_dim + k];
+
+                float dt_bias_val = ctx->dt_bias[h];
+                float ssm_a_val = ctx->ssm_a[h];
+                for (uint32_t t0 = 0; t0 < ctx->B; t0 += 32u)
+                {
+                    uint32_t nt = ctx->B - t0;
+                    if (nt > 32u) nt = 32u;
+                    for (uint32_t tc = 0; tc < nt; ++tc)
+                    {
+                        uint32_t t = t0 + tc;
+                        const float *qkv = ctx->qkvb + (size_t)t * ctx->qkv_dim;
+                        const float *qh = qkv + (size_t)h * k_dim;
+                        const float *kh = qkv + ctx->inner + (size_t)h * k_dim;
+                        const float *vh = qkv + 2 * ctx->inner + (size_t)h * v_dim;
+                        float *qp = Q_tile + (size_t)tc * k_dim;
+                        float *kp = K_tile + (size_t)tc * k_dim;
+                        float *vp = V_tile + (size_t)tc * v_dim;
+                        float q_ss = 0.0f, k_ss = 0.0f;
+                        for (uint32_t i = 0; i < k_dim; ++i)
+                        {
+                            q_ss += qh[i] * qh[i];
+                            k_ss += kh[i] * kh[i];
+                        }
+                        float q_inv = ctx->q_scale / sqrtf(q_ss + 1e-6f);
+                        float k_inv = 1.0f / sqrtf(k_ss + 1e-6f);
+                        for (uint32_t i = 0; i < k_dim; ++i)
+                        {
+                            qp[i] = qh[i] * q_inv;
+                            kp[i] = kh[i] * k_inv;
+                        }
+                        memcpy(vp, vh, v_dim * sizeof(float));
+                        float dt = fast_softplus(ctx->ab[(size_t)t * ctx->ssm_r + h] + dt_bias_val);
+                        log_g_arr[tc] = ssm_a_val * dt;
+                        g_arr[tc] = expf(log_g_arr[tc]);
+                        beta_arr[tc] = fast_sigmoid(ctx->bb[(size_t)t * ctx->ssm_r + h]);
+                    }
+                    if (asi_deltanet_wy_chunk(wb, Q_tile, K_tile, V_tile, log_g_arr, beta_arr, O_tile, nt, k_dim, v_dim) != 0)
+                    {
+                        for (uint32_t j = 0; j < v_dim; ++j)
+                            for (uint32_t k = 0; k < k_dim; ++k)
+                                S[(size_t)j * k_dim + k] = wb->S_T[(size_t)k * v_dim + j];
+                        for (uint32_t j = 0; j < v_dim; ++j)
+                        {
+                            float *Sj = S + (size_t)j * k_dim;
+                            for (uint32_t tc = 0; tc < nt; ++tc)
+                            {
+                                const float *kp = K_tile + (size_t)tc * k_dim;
+                                const float *qp = Q_tile + (size_t)tc * k_dim;
+                                float g = g_arr[tc], beta = beta_arr[tc], pred = 0.0f;
+                                for (uint32_t i = 0; i < k_dim; ++i) { Sj[i] *= g; pred += Sj[i] * kp[i]; }
+                                float d = beta * (V_tile[(size_t)tc * v_dim + j] - pred), outv = 0.0f;
+                                for (uint32_t i = 0; i < k_dim; ++i) { Sj[i] += d * kp[i]; outv += Sj[i] * qp[i]; }
+                                O_tile[(size_t)tc * v_dim + j] = outv;
+                            }
+                        }
+                        for (uint32_t j = 0; j < v_dim; ++j)
+                            for (uint32_t k = 0; k < k_dim; ++k)
+                                wb->S_T[(size_t)k * v_dim + j] = S[(size_t)j * k_dim + k];
+                    }
+                    for (uint32_t tc = 0; tc < nt; ++tc)
+                    {
+                        uint32_t t = t0 + tc;
+                        float *oh = ctx->aob + (size_t)t * ctx->inner + (size_t)h * v_dim;
+                        const float *zh = ctx->zb + (size_t)t * ctx->inner + (size_t)h * v_dim;
+                        rmsnorm(oh, O_tile + (size_t)tc * v_dim, ctx->ssm_norm_w, v_dim, ctx->rms_eps);
+                        fast_silu_mul_out_vec(oh, zh, v_dim);
+                    }
+                }
+                for (uint32_t j = 0; j < v_dim; ++j)
+                    for (uint32_t k = 0; k < k_dim; ++k)
+                        S[(size_t)j * k_dim + k] = wb->S_T[(size_t)k * v_dim + j];
+            }
+            asi_aligned_free(wb);
+            return;
+        }
+    }
 
 #if defined(__AVX2__)
     if (ctx->B >= 1 && (k_dim & 7u) == 0u && (v_dim & 3u) == 0u && k_dim <= 256 && v_dim <= 256 &&
@@ -2515,6 +3935,10 @@ typedef struct {
     float rope_theta;
     float rms_eps;
     float scale;
+    const uint32_t *mrope_pos_3d;
+    uint32_t mrope_sections[3];
+    uint32_t mrope_flags;
+    int64_t rope_pos_delta;
     _Alignas(64) atomic_int next_h;
 } AsiFullAttnBatchCtx;
 
@@ -2586,15 +4010,28 @@ static void asi_full_attn_batch_worker(int tid, int n_threads, void *vctx)
             float inv_sum[4 * 8];
             for (uint32_t tc = 0; tc < nt; ++tc)
             {
-                uint32_t pos = ctx->pos_start + t0 + tc;
-                float *qg = ctx->qgb + (size_t)(t0 + tc) * ctx->qg_dim;
+                uint32_t tok_i = t0 + tc;
+                uint32_t pos = ctx->pos_start + tok_i;
+                float *qg = ctx->qgb + (size_t)tok_i * ctx->qg_dim;
                 for (uint32_t r = 0; r < n_rep; ++r)
                 {
                     uint32_t idx = tc * n_rep + r;
                     float *qh = qg + (size_t)(h_base + r) * 2 * hd;
                     float *q_dst = q_blk + (size_t)idx * hd;
                     rmsnorm(q_dst, qh, ctx->qn_w, hd, ctx->rms_eps);
-                    apply_rope_neox_partial(q_dst, ctx->rope_dim, pos, ctx->rope_theta, ctx->rope_inv_freq);
+                    if (ctx->mrope_pos_3d)
+                    {
+                        const uint32_t *p3 = ctx->mrope_pos_3d + (size_t)tok_i * 3u;
+                        apply_rope_neox_3d(q_dst, ctx->rope_dim, p3[0], p3[1], p3[2],
+                                           ctx->mrope_sections, ctx->mrope_flags,
+                                           ctx->rope_theta, ctx->rope_inv_freq);
+                    }
+                    else
+                    {
+                        uint32_t rpos = asi_effective_rope_pos(ctx->rope_pos_delta, pos);
+                        apply_rope_neox_partial(q_dst, ctx->rope_dim, rpos,
+                                                ctx->rope_theta, ctx->rope_inv_freq);
+                    }
                     max_s[idx] = -1e30f;
                 }
             }
@@ -2773,7 +4210,19 @@ static void asi_full_attn_batch_worker(int tid, int n_threads, void *vctx)
             float *qh = qg + (size_t)h * 2 * hd;
             const float *gh = qh + hd;
             rmsnorm(qh, qh, ctx->qn_w, hd, ctx->rms_eps);
-            apply_rope_neox_partial(qh, ctx->rope_dim, pos, ctx->rope_theta, ctx->rope_inv_freq);
+            if (ctx->mrope_pos_3d)
+            {
+                const uint32_t *p3 = ctx->mrope_pos_3d + (size_t)t * 3u;
+                apply_rope_neox_3d(qh, ctx->rope_dim, p3[0], p3[1], p3[2],
+                                   ctx->mrope_sections, ctx->mrope_flags,
+                                   ctx->rope_theta, ctx->rope_inv_freq);
+            }
+            else
+            {
+                uint32_t rpos = asi_effective_rope_pos(ctx->rope_pos_delta, pos);
+                apply_rope_neox_partial(qh, ctx->rope_dim, rpos,
+                                        ctx->rope_theta, ctx->rope_inv_freq);
+            }
 
             float max_score = -1e30f;
             for (uint32_t p = 0; p <= pos; ++p)
@@ -2830,6 +4279,11 @@ static void qwen35_step_deltanet(AsiArchSession *s, uint32_t layer_idx, Qwen35To
     if (s->fp32_ref)
     {
         matvec_fused_q8k_pool(s->pool, cart, ts, outs, 4, NULL, bpr, sc->x_norm, (int)c->hidden_size, 0, 1);
+    }
+    else if (!asi_tensor_needs_q8k(ts[0]) || !asi_tensor_needs_q8k(ts[1]) ||
+             !asi_tensor_needs_q8k(ts[2]) || !asi_tensor_needs_q8k(ts[3]))
+    {
+        matvec_fused_q8k_pool(s->pool, cart, ts, outs, 4, NULL, bpr, sc->x_norm, (int)c->hidden_size, 0, 0);
     }
     else
     {
@@ -2910,6 +4364,10 @@ static void qwen35_step_full_attn(AsiArchSession *s, uint32_t layer_idx, uint32_
     {
         matvec_fused_q8k_pool(s->pool, cart, ts, outs, 3, NULL, bpr, sc->x_norm, (int)c->hidden_size, 0, 1);
     }
+    else if (!asi_tensor_needs_q8k(ts[0]) || !asi_tensor_needs_q8k(ts[1]) || !asi_tensor_needs_q8k(ts[2]))
+    {
+        matvec_fused_q8k_pool(s->pool, cart, ts, outs, 3, NULL, bpr, sc->x_norm, (int)c->hidden_size, 0, 0);
+    }
     else
     {
         LilaQ8KBlock stack_qx[64];
@@ -2936,11 +4394,12 @@ static void qwen35_step_full_attn(AsiArchSession *s, uint32_t layer_idx, uint32_
     const float *qn_w = (const float *)tensor_data(cart, lw->attn_q_norm);
     const float *kn_w = (const float *)tensor_data(cart, lw->attn_k_norm);
 
+    uint32_t rpos = asi_effective_rope_pos(s->mrope_pos_delta, pos);
     for (uint32_t h = 0; h < n_kv; ++h)
     {
         float *kh = sc->k + (size_t)h * hd;
         rmsnorm(kh, kh, kn_w, hd, c->rms_norm_eps);
-        apply_rope_neox_partial(kh, c->rope_dim, pos, c->rope_theta, s->rope_inv_freq);
+        apply_rope_neox_partial(kh, c->rope_dim, rpos, c->rope_theta, s->rope_inv_freq);
     }
 
     uint16_t *k_dst = kv->k_cache + (size_t)pos * kv_dim;
@@ -2983,6 +4442,7 @@ static void qwen35_step_full_attn(AsiArchSession *s, uint32_t layer_idx, uint32_
     fctx.rope_theta = c->rope_theta;
     fctx.rms_eps = c->rms_norm_eps;
     fctx.scale = 1.0f / sqrtf((float)hd);
+    fctx.rope_pos_delta = s->mrope_pos_delta;
     atomic_init(&fctx.next_h, 0);
     asi_pool_run(s->pool, asi_full_attn_batch_worker, &fctx);
 
@@ -3013,6 +4473,7 @@ static int qwen35_forward_token(AsiArchSession *s, int32_t token_id, uint32_t po
 
     s->spec_count = 0;
     s->spec_cursor = 0;
+    if (pos == 0) s->mrope_pos_delta = 0;
     if (pos < s->kv_dirty_from) s->kv_dirty_from = pos;
     if (pos < s->history_valid_from) s->history_valid_from = pos;
     if (s->token_history)
@@ -3071,6 +4532,10 @@ static int qwen35_forward_token(AsiArchSession *s, int32_t token_id, uint32_t po
         {
             matvec_fused_q8k_pool(s->pool, cart, ts, outs, 2, NULL, bpr, sc->x_norm, (int)c->hidden_size, 1, 1);
         }
+        else if (!asi_tensor_needs_q8k(ts[0]) || !asi_tensor_needs_q8k(ts[1]))
+        {
+            matvec_fused_q8k_pool(s->pool, cart, ts, outs, 2, NULL, bpr, sc->x_norm, (int)c->hidden_size, 1, 0);
+        }
         else
         {
             LilaQ8KBlock stack_qx[64];
@@ -3088,7 +4553,15 @@ static int qwen35_forward_token(AsiArchSession *s, int32_t token_id, uint32_t po
                 fast_silu_mul_vec(sc->ffn_gate, sc->ffn_up, c->intermediate_size);
             }
         }
-        matvec_tensor_pool(s->pool, cart, lw->ffn_down, sc->proj_out, sc->ffn_gate, s->fp32_ref);
+        if (!s->fp32_ref && lw->ffn_down->quant_type == ASI_QUANT_Q4_REPACK &&
+            (lw->ffn_down->layout_flags & ASI_TENSOR_LAYOUT_COL_MAJOR))
+        {
+            matvec_q4_col_major_pool(s->pool, cart, lw->ffn_down, sc->proj_out, sc->ffn_gate, s->ffn_sparse_keep);
+        }
+        else
+        {
+            matvec_tensor_pool(s->pool, cart, lw->ffn_down, sc->proj_out, sc->ffn_gate, s->fp32_ref);
+        }
         for (uint32_t i = 0; i < c->hidden_size; ++i)
         {
             sc->x[i] += sc->proj_out[i];
@@ -3148,7 +4621,7 @@ static int ensure_batch_scratch(AsiArchSession *s, uint32_t B)
     free(sc->xb); free(sc->xnb); free(sc->projb); free(sc->qkvb);
     free(sc->zb); free(sc->ab); free(sc->bb); free(sc->qgb);
     free(sc->kb); free(sc->vb); free(sc->aob); free(sc->fgb);
-    free(sc->fub); free(sc->qx_h);
+    free(sc->fub); asi_aligned_free(sc->qx_h);
 
     sc->xb    = (float *)malloc((size_t)B * H * sizeof(float));
     sc->xnb   = (float *)malloc((size_t)B * H * sizeof(float));
@@ -3164,7 +4637,7 @@ static int ensure_batch_scratch(AsiArchSession *s, uint32_t B)
     sc->fgb   = (float *)malloc((size_t)B * I * sizeof(float));
     sc->fub   = (float *)malloc((size_t)B * I * sizeof(float));
     size_t qx_h_sz = (size_t)B * (size_t)bpr_max * sizeof(LilaQ8KBlock);
-    sc->qx_h  = qx_h_sz ? (LilaQ8KBlock *)aligned_alloc(64, qx_h_sz) : NULL;
+    sc->qx_h  = qx_h_sz ? (LilaQ8KBlock *)asi_aligned_alloc(64, qx_h_sz) : NULL;
 
     if (!sc->xb || !sc->xnb || !sc->projb || !sc->qkvb || !sc->zb || !sc->ab || !sc->bb ||
         !sc->qgb || !sc->kb || !sc->vb || !sc->aob || !sc->fgb || !sc->fub || !sc->qx_h)
@@ -3275,6 +4748,10 @@ typedef struct {
     uint32_t rope_dim;
     float rope_theta;
     float rms_eps;
+    const uint32_t *mrope_pos_3d;
+    uint32_t mrope_sections[3];
+    uint32_t mrope_flags;
+    int64_t rope_pos_delta;
 } AsiKvPrepBatchCtx;
 
 static void asi_kv_prep_batch_worker(int tid, int n_threads, void *vctx)
@@ -3294,7 +4771,19 @@ static void asi_kv_prep_batch_worker(int tid, int n_threads, void *vctx)
         {
             float *kh = k + (size_t)h * hd;
             rmsnorm(kh, kh, ctx->kn_w, hd, ctx->rms_eps);
-            apply_rope_neox_partial(kh, ctx->rope_dim, pos, ctx->rope_theta, ctx->rope_inv_freq);
+            if (ctx->mrope_pos_3d)
+            {
+                const uint32_t *p3 = ctx->mrope_pos_3d + (size_t)t * 3u;
+                apply_rope_neox_3d(kh, ctx->rope_dim, p3[0], p3[1], p3[2],
+                                   ctx->mrope_sections, ctx->mrope_flags,
+                                   ctx->rope_theta, ctx->rope_inv_freq);
+            }
+            else
+            {
+                uint32_t rpos = asi_effective_rope_pos(ctx->rope_pos_delta, pos);
+                apply_rope_neox_partial(kh, ctx->rope_dim, rpos,
+                                        ctx->rope_theta, ctx->rope_inv_freq);
+            }
         }
         uint16_t *k_dst = ctx->k_cache + (size_t)pos * kv_dim;
         uint16_t *v_dst = ctx->v_cache + (size_t)pos * kv_dim;
@@ -3323,7 +4812,12 @@ static int qwen35_forward_chunk_ex(AsiArchSession *s,
                                    int compute_logits,
                                    int spec_mode,
                                    float *out_last_logits,
-                                   float *out_spec_logits)
+                                   float *out_spec_logits,
+                                   const float *input_embds,
+                                   const uint32_t *mrope_pos_3d,
+                                   const uint32_t mrope_sections[3],
+                                   uint32_t mrope_flags,
+                                   const volatile int *cancel_flag)
 {
     int do_prof = asi_runtime_config()->profile;
     double tc0 = do_prof ? asi_now_ms() : 0.0;
@@ -3357,31 +4851,49 @@ static int qwen35_forward_chunk_ex(AsiArchSession *s,
     float *fub   = s->scratch.fub;
     LilaQ8KBlock *qx_h = s->scratch.qx_h;
 
-    const uint8_t *embd_base = tensor_data(cart, s->token_embd);
-    int is_embd_repacked = (s->token_embd->layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK) ? 1 : 0;
-    size_t embd_rb = lila_quant_row_bytes(s->token_embd->quant_type, (int)H, is_embd_repacked);
-    if (embd_rb == 0) return -1;
-    AsiEmbdBatchCtx ectx = {embd_base, token_ids, xb, B, H, embd_rb, s->token_embd->quant_type, is_embd_repacked};
-    if (s->pool && B >= 16)
-        asi_pool_run(s->pool, asi_embd_batch_worker, &ectx);
+    if (input_embds != NULL)
+    {
+        memcpy(xb, input_embds, (size_t)B * H * sizeof(float));
+    }
     else
-        asi_embd_batch_worker(0, 1, &ectx);
+    {
+        const uint8_t *embd_base = tensor_data(cart, s->token_embd);
+        int is_embd_repacked = (s->token_embd->layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK) ? 1 : 0;
+        size_t embd_rb = lila_quant_row_bytes(s->token_embd->quant_type, (int)H, is_embd_repacked);
+        if (embd_rb == 0) return -1;
+        AsiEmbdBatchCtx ectx = {embd_base, token_ids, xb, B, H, embd_rb, s->token_embd->quant_type, is_embd_repacked};
+        if (s->pool && B >= 16)
+            asi_pool_run(s->pool, asi_embd_batch_worker, &ectx);
+        else
+            asi_embd_batch_worker(0, 1, &ectx);
+    }
 
+    const int use_blis = (!s->fp32_ref &&
+                          (int)B >= asi_runtime_config()->blis_min_tokens &&
+                          asi_blis_prefill_enabled() &&
+                          asi_cpu_has_avx2_fma_f16c());
     {
         double tp = do_prof ? asi_now_ms() : 0.0;
         const float *an0_w = (const float *)tensor_data(cart, s->layers[0].attn_norm);
-        asi_norm_quant_pool(s->pool, xb, NULL, xnb, qx_h, an0_w, B, H, c->rms_norm_eps, 0, 1, !s->fp32_ref);
+        const AsiV2TensorEntry *l0_t = (s->layers[0].kind == QWEN35_LAYER_DELTANET)
+                                           ? s->layers[0].attn_qkv
+                                           : s->layers[0].attn_q;
+        int need_q8 = (!s->fp32_ref && asi_tensor_needs_q8k(l0_t) &&
+                       !(use_blis && asi_tensor_blis_supported(l0_t)));
+        asi_norm_quant_pool(s->pool, xb, NULL, xnb, qx_h, an0_w, B, H, c->rms_norm_eps, 0, 1, need_q8);
         if (do_prof) t_norm += asi_now_ms() - tp;
     }
 
     uint32_t i_dn = 0;
     for (uint32_t l = 0; l < c->n_layers; ++l)
     {
+        if (cancel_flag && *cancel_flag) return -2;
         const Qwen35LayerWeights *lw = &s->layers[l];
         double tp = 0.0;
 
         if (lw->kind == QWEN35_LAYER_DELTANET)
         {
+            if (s->calib_hook) s->calib_hook(s->calib_ctx, l, 0, xnb, B, H);
             tp = do_prof ? asi_now_ms() : 0.0;
             const AsiV2TensorEntry *ts[4] = {lw->attn_qkv, lw->attn_gate, lw->ssm_alpha, lw->ssm_beta};
             float *outs[4] = {qkvb, zb, ab, bb};
@@ -3430,14 +4942,18 @@ static int qwen35_forward_chunk_ex(AsiArchSession *s,
             tp = do_prof ? asi_now_ms() : 0.0;
             int ssm_in_cols = (int)lw->ssm_out->shape[0];
             int ssm_in_bpr = (ssm_in_cols + QK_K - 1) / QK_K;
-            if (!s->fp32_ref) quantize_batch_q8k_pool(s->pool, qx_h, aob, (int)B, ssm_in_cols);
+            if (s->calib_hook) s->calib_hook(s->calib_ctx, l, 1, aob, B, (uint32_t)ssm_in_cols);
+            int need_q8_ssm_out = (!s->fp32_ref && asi_tensor_needs_q8k(lw->ssm_out) &&
+                                   !(use_blis && asi_tensor_blis_supported(lw->ssm_out)));
+            if (need_q8_ssm_out) quantize_batch_q8k_pool(s->pool, qx_h, aob, (int)B, ssm_in_cols);
             matmul_batch_tensor_qx(s->pool, cart, lw->ssm_out, projb,
-                                   s->fp32_ref ? NULL : qx_h, aob, (int)B, ssm_in_bpr, s->fp32_ref);
+                                   need_q8_ssm_out ? qx_h : NULL, aob, (int)B, ssm_in_bpr, s->fp32_ref);
             if (do_prof) t_mm += asi_now_ms() - tp;
             i_dn++;
         }
         else
         {
+            if (s->calib_hook) s->calib_hook(s->calib_ctx, l, 0, xnb, B, H);
             tp = do_prof ? asi_now_ms() : 0.0;
             const AsiV2TensorEntry *ts[3] = {lw->attn_q, lw->attn_k, lw->attn_v};
             float *outs[3] = {qgb, kb, vb};
@@ -3455,10 +4971,31 @@ static int qwen35_forward_chunk_ex(AsiArchSession *s,
             float scale = 1.0f / sqrtf((float)hd);
 
             tp = do_prof ? asi_now_ms() : 0.0;
-            AsiKvPrepBatchCtx kctx = {
-                kb, vb, kv->k_cache, kv->v_cache, kn_w, s->rope_inv_freq,
-                B, pos_start, n_kv, hd, kv_dim, c->rope_dim, c->rope_theta, c->rms_norm_eps
-            };
+            AsiKvPrepBatchCtx kctx;
+            memset(&kctx, 0, sizeof(kctx));
+            kctx.kb = kb;
+            kctx.vb = vb;
+            kctx.k_cache = kv->k_cache;
+            kctx.v_cache = kv->v_cache;
+            kctx.kn_w = kn_w;
+            kctx.rope_inv_freq = s->rope_inv_freq;
+            kctx.B = B;
+            kctx.pos_start = pos_start;
+            kctx.n_kv = n_kv;
+            kctx.hd = hd;
+            kctx.kv_dim = kv_dim;
+            kctx.rope_dim = c->rope_dim;
+            kctx.rope_theta = c->rope_theta;
+            kctx.rms_eps = c->rms_norm_eps;
+            kctx.mrope_pos_3d = mrope_pos_3d;
+            kctx.mrope_flags = mrope_flags;
+            kctx.rope_pos_delta = s->mrope_pos_delta;
+            if (mrope_sections)
+            {
+                kctx.mrope_sections[0] = mrope_sections[0];
+                kctx.mrope_sections[1] = mrope_sections[1];
+                kctx.mrope_sections[2] = mrope_sections[2];
+            }
             if (s->pool && B >= 8)
                 asi_pool_run(s->pool, asi_kv_prep_batch_worker, &kctx);
             else
@@ -3486,38 +5023,73 @@ static int qwen35_forward_chunk_ex(AsiArchSession *s,
             fctx.rope_theta = c->rope_theta;
             fctx.rms_eps = c->rms_norm_eps;
             fctx.scale = scale;
+            fctx.mrope_pos_3d = mrope_pos_3d;
+            fctx.mrope_flags = mrope_flags;
+            fctx.rope_pos_delta = s->mrope_pos_delta;
+            memcpy(fctx.mrope_sections, kctx.mrope_sections, sizeof(fctx.mrope_sections));
             atomic_init(&fctx.next_h, 0);
             asi_pool_run(s->pool, asi_full_attn_batch_worker, &fctx);
             if (do_prof) t_attn += asi_now_ms() - tp;
             tp = do_prof ? asi_now_ms() : 0.0;
             int attn_in_cols = (int)lw->attn_output->shape[0];
             int attn_in_bpr = (attn_in_cols + QK_K - 1) / QK_K;
-            if (!s->fp32_ref) quantize_batch_q8k_pool(s->pool, qx_h, aob, (int)B, attn_in_cols);
+            if (s->calib_hook) s->calib_hook(s->calib_ctx, l, 1, aob, B, (uint32_t)attn_in_cols);
+            int need_q8_attn_out = (!s->fp32_ref && asi_tensor_needs_q8k(lw->attn_output) &&
+                                    !(use_blis && asi_tensor_blis_supported(lw->attn_output)));
+            if (need_q8_attn_out) quantize_batch_q8k_pool(s->pool, qx_h, aob, (int)B, attn_in_cols);
             matmul_batch_tensor_qx(s->pool, cart, lw->attn_output, projb,
-                                   s->fp32_ref ? NULL : qx_h, aob, (int)B, attn_in_bpr, s->fp32_ref);
+                                   need_q8_attn_out ? qx_h : NULL, aob, (int)B, attn_in_bpr, s->fp32_ref);
             if (do_prof) t_mm += asi_now_ms() - tp;
         }
 
         tp = do_prof ? asi_now_ms() : 0.0;
         const float *pn_w = (const float *)tensor_data(cart, lw->post_attn_norm);
-        asi_norm_quant_pool(s->pool, xb, projb, xnb, qx_h, pn_w, B, H, c->rms_norm_eps, 1, 1, !s->fp32_ref);
+        int need_q8_ffn = (!s->fp32_ref && asi_tensor_needs_q8k(lw->ffn_gate) &&
+                           !(use_blis && asi_tensor_blis_supported(lw->ffn_gate)));
+        asi_norm_quant_pool(s->pool, xb, projb, xnb, qx_h, pn_w, B, H, c->rms_norm_eps, 1, 1, need_q8_ffn);
         if (do_prof) t_norm += asi_now_ms() - tp;
         tp = do_prof ? asi_now_ms() : 0.0;
         const AsiV2TensorEntry *ffn_ts[2] = {lw->ffn_gate, lw->ffn_up};
         float *ffn_outs[2] = {fgb, fub};
+        if (s->calib_hook) s->calib_hook(s->calib_ctx, l, 2, xnb, B, H);
         matmul_batch_fused_q8k_pool(s->pool, cart, ffn_ts, ffn_outs, 2,
-                                    s->fp32_ref ? NULL : qx_h, xnb, (int)B, bpr_h, 1, s->fp32_ref);
+                                    need_q8_ffn ? qx_h : NULL, xnb, (int)B, bpr_h, 1, s->fp32_ref);
         if (do_prof) t_mm += asi_now_ms() - tp;
         tp = do_prof ? asi_now_ms() : 0.0;
         int ffn_in_bpr = ((int)I + QK_K - 1) / QK_K;
-        if (!s->fp32_ref) quantize_batch_q8k_pool(s->pool, qx_h, fgb, (int)B, (int)I);
-        matmul_batch_tensor_qx(s->pool, cart, lw->ffn_down, projb,
-                               s->fp32_ref ? NULL : qx_h, fgb, (int)B, ffn_in_bpr, s->fp32_ref);
+        if (s->calib_hook) s->calib_hook(s->calib_ctx, l, 3, fgb, B, I);
+        int need_q8_down = (!s->fp32_ref && asi_tensor_needs_q8k(lw->ffn_down) &&
+                            !(use_blis && asi_tensor_blis_supported(lw->ffn_down)));
+        if (spec_mode && !s->fp32_ref && lw->ffn_down->quant_type == ASI_QUANT_Q4_REPACK &&
+            (lw->ffn_down->layout_flags & ASI_TENSOR_LAYOUT_COL_MAJOR))
+        {
+            for (uint32_t tok = 0; tok < B; ++tok)
+            {
+                matvec_q4_col_major_pool(s->pool, cart, lw->ffn_down,
+                                         projb + (size_t)tok * H,
+                                         fgb + (size_t)tok * I,
+                                         s->ffn_sparse_keep);
+            }
+        }
+        else
+        {
+            if (need_q8_down) quantize_batch_q8k_pool(s->pool, qx_h, fgb, (int)B, (int)I);
+            matmul_batch_tensor_qx(s->pool, cart, lw->ffn_down, projb,
+                                   need_q8_down ? qx_h : NULL, fgb, (int)B, ffn_in_bpr, s->fp32_ref);
+        }
         if (do_prof) t_mm += asi_now_ms() - tp;
         tp = do_prof ? asi_now_ms() : 0.0;
         const float *next_an = (l + 1 < c->n_layers) ? (const float *)tensor_data(cart, s->layers[l + 1].attn_norm) : NULL;
+        int need_q8_next = 0;
+        if (next_an && !s->fp32_ref)
+        {
+            const AsiV2TensorEntry *nl_t = (s->layers[l + 1].kind == QWEN35_LAYER_DELTANET)
+                                               ? s->layers[l + 1].attn_qkv
+                                               : s->layers[l + 1].attn_q;
+            need_q8_next = asi_tensor_needs_q8k(nl_t) && !(use_blis && asi_tensor_blis_supported(nl_t));
+        }
         asi_norm_quant_pool(s->pool, xb, projb, xnb, qx_h, next_an, B, H, c->rms_norm_eps,
-                            1, (next_an != NULL), (next_an != NULL && !s->fp32_ref));
+                            1, (next_an != NULL), need_q8_next);
         if (do_prof) t_norm += asi_now_ms() - tp;
     }
 
@@ -3597,7 +5169,8 @@ static int qwen35_forward_chunk(AsiArchSession *s,
                                 int compute_logits,
                                 float *out_last_logits)
 {
-    return qwen35_forward_chunk_ex(s, token_ids, B, pos_start, compute_logits, 0, out_last_logits, NULL);
+    return qwen35_forward_chunk_ex(s, token_ids, B, pos_start, compute_logits, 0, out_last_logits, NULL,
+                                   NULL, NULL, NULL, 0u, NULL);
 }
 
 static int32_t asi_argmax_f32(const float *v, uint32_t n)
@@ -3890,6 +5463,7 @@ static int qwen35_forward_speculative(AsiArchSession *s,
     batch_toks[0] = token_id;
     uint32_t max_k = (uint32_t)s->spec_draft_len;
     if (max_k > ASI_SPEC_MAX_K) max_k = ASI_SPEC_MAX_K;
+    if (s->has_q4_repack && max_k > 2u) max_k = 2u; /* E07 Exp 3C: Broadwell 16 YMM register cap (B <= 3) */
     if (ensure_spec_buffers(s) != 0)
     {
         return qwen35_forward_token(s, token_id, pos, out_logits);
@@ -3965,7 +5539,8 @@ static int qwen35_forward_speculative(AsiArchSession *s,
     s->stat_drafted += k;
 
     asi_pool_begin(s->pool);
-    int rc = qwen35_forward_chunk_ex(s, batch_toks, 1u + k, pos, 1, 1, out_logits, s->spec_logits);
+    int rc = qwen35_forward_chunk_ex(s, batch_toks, 1u + k, pos, 1, 1, out_logits, s->spec_logits,
+                                     NULL, NULL, NULL, 0u, NULL);
     asi_pool_end(s->pool);
     if (rc != 0) return rc;
 
@@ -4029,6 +5604,7 @@ static int qwen35_forward_batch(AsiArchSession *s,
     if (pos_start < s->history_valid_from) s->history_valid_from = pos_start;
     if (pos_start == 0)
     {
+        s->mrope_pos_delta = 0;
         s->prompt_len = n_tokens;
         s->history_valid_from = 0;
     }
@@ -4120,6 +5696,7 @@ static int qwen35_save_prefix(AsiArchSession *s, uint32_t n_tokens)
         }
     }
     s->prefix_len = n_tokens;
+    s->prefix_mrope_delta = s->mrope_pos_delta;
     free(s->prefix_tokens);
     s->prefix_tokens = NULL;
     s->prefix_has_tokens = 0;
@@ -4173,6 +5750,7 @@ static int qwen35_restore_prefix(AsiArchSession *s, uint32_t *out_n_tokens)
     s->spec_start_pos = 0;
     s->spec_consec_misses = 0;
     s->spec_cooldown = 0;
+    s->mrope_pos_delta = s->prefix_mrope_delta;
     s->fail_gen++;
     if (s->fail_gen == 0)
     {
@@ -4217,7 +5795,7 @@ _Static_assert(sizeof(AsiPrefixSnapshotHeader) == 144, "AsiPrefixSnapshotHeader 
 _Static_assert(offsetof(AsiPrefixSnapshotHeader, header_crc64) == 136, "header_crc64 offset mismatch");
 
 static uint64_t g_asi_pfx_crc64_tab[256];
-static pthread_once_t g_asi_pfx_crc64_once = PTHREAD_ONCE_INIT;
+static AsiOnce g_asi_pfx_crc64_once = ASI_ONCE_INIT;
 
 static void asi_pfx_crc64_init(void)
 {
@@ -4237,7 +5815,7 @@ static void asi_pfx_crc64_init(void)
 
 static uint64_t asi_crc64_update(uint64_t crc, const uint8_t *data, size_t len)
 {
-    pthread_once(&g_asi_pfx_crc64_once, asi_pfx_crc64_init);
+    asi_call_once(&g_asi_pfx_crc64_once, asi_pfx_crc64_init);
     for (size_t i = 0; i < len; ++i)
     {
         crc = (crc << 8) ^ g_asi_pfx_crc64_tab[((crc >> 56) ^ data[i]) & 0xFFu];
@@ -4306,6 +5884,7 @@ static int qwen35_save_prefix_file(const AsiArchSession *s,
     hdr.ssm_bytes = ssm_bytes;
     hdr.k_bytes = k_bytes;
     hdr.v_bytes = v_bytes;
+    hdr.reserved = (uint64_t)s->prefix_mrope_delta;
 
     uint64_t pcrc = 0;
     if (conv_bytes) pcrc = asi_crc64_update(pcrc, (const uint8_t *)s->prefix_conv, (size_t)conv_bytes);
@@ -4319,7 +5898,7 @@ static int qwen35_save_prefix_file(const AsiArchSession *s,
     size_t tcap = flen + 64;
     char *tmp_path = (char *)malloc(tcap);
     if (!tmp_path) return -1;
-    int tn = snprintf(tmp_path, tcap, "%s.tmp.%ld", filepath, (long)getpid());
+    int tn = snprintf(tmp_path, tcap, "%s.tmp.%ld", filepath, asi_getpid());
     if (tn <= 0 || (size_t)tn >= tcap)
     {
         free(tmp_path);
@@ -4340,7 +5919,7 @@ static int qwen35_save_prefix_file(const AsiArchSession *s,
         (v_bytes > 0    && fwrite(s->prefix_v,    1, (size_t)v_bytes,    fp) != (size_t)v_bytes))
     {
         fclose(fp);
-        unlink(tmp_path);
+        asi_unlink(tmp_path);
         free(tmp_path);
         return -1;
     }
@@ -4348,27 +5927,26 @@ static int qwen35_save_prefix_file(const AsiArchSession *s,
     if (fflush(fp) != 0)
     {
         fclose(fp);
-        unlink(tmp_path);
+        asi_unlink(tmp_path);
         free(tmp_path);
         return -1;
     }
-    int fd = fileno(fp);
-    if (fd >= 0 && fsync(fd) != 0 && errno != EINVAL && errno != EROFS)
+    if (asi_fsync_file(fp) != 0)
     {
         fclose(fp);
-        unlink(tmp_path);
+        asi_unlink(tmp_path);
         free(tmp_path);
         return -1;
     }
     if (fclose(fp) != 0)
     {
-        unlink(tmp_path);
+        asi_unlink(tmp_path);
         free(tmp_path);
         return -1;
     }
-    if (rename(tmp_path, filepath) != 0)
+    if (asi_atomic_rename(tmp_path, filepath) != 0)
     {
-        unlink(tmp_path);
+        asi_unlink(tmp_path);
         free(tmp_path);
         return -1;
     }
@@ -4456,6 +6034,7 @@ static int qwen35_load_prefix_file(AsiArchSession *s,
     s->prefix_k    = new_k;
     s->prefix_v    = new_v;
     s->prefix_len  = hdr.prefix_len;
+    s->prefix_mrope_delta = (int64_t)hdr.reserved;
     free(s->prefix_tokens);
     s->prefix_tokens = NULL;
     s->prefix_has_tokens = 0;
@@ -4468,6 +6047,116 @@ fail:
     free(new_k);
     free(new_v);
     return -1;
+}
+
+static int64_t qwen35_get_rope_delta(const AsiArchSession *s)
+{
+    return s ? s->mrope_pos_delta : 0;
+}
+
+static void qwen35_set_rope_delta(AsiArchSession *s, int64_t delta)
+{
+    if (s) s->mrope_pos_delta = delta;
+}
+
+static void qwen35_set_calib_hook(AsiArchSession *s,
+                                  void (*fn)(void *, uint32_t, int, const float *, uint32_t, uint32_t),
+                                  void *user_ctx)
+{
+    if (s)
+    {
+        s->calib_hook = fn;
+        s->calib_ctx = user_ctx;
+    }
+}
+
+static int qwen35_forward_embd(AsiArchSession *s,
+                               const float *embds,
+                               uint32_t n_tokens,
+                               uint32_t kv_pos_start,
+                               const uint32_t *mrope_pos_3d,
+                               const uint32_t mrope_sections[3],
+                               uint32_t mrope_flags,
+                               uint32_t next_rope_pos,
+                               const volatile int *cancel_flag,
+                               float *out_last_logits)
+{
+    if (!s || !embds || n_tokens == 0u) return -1;
+    if (kv_pos_start + n_tokens > s->max_ctx) return -1;
+    if (cancel_flag && *cancel_flag) return -2;
+
+    const uint32_t H = s->cart->config.hidden_size;
+    size_t total_floats = (size_t)n_tokens * (size_t)H;
+    for (size_t i = 0; i < total_floats; ++i)
+    {
+        if (!isfinite(embds[i])) return -1;
+    }
+
+    s->spec_count = 0;
+    s->spec_cursor = 0;
+    if (kv_pos_start < s->kv_dirty_from) s->kv_dirty_from = kv_pos_start;
+    if (kv_pos_start == 0u)
+    {
+        s->mrope_pos_delta = 0;
+        s->prompt_len = n_tokens;
+    }
+    else if (kv_pos_start <= s->prompt_len && kv_pos_start + n_tokens > s->prompt_len)
+    {
+        s->prompt_len = kv_pos_start + n_tokens;
+    }
+    if (s->token_history)
+    {
+        for (uint32_t i = 0; i < n_tokens; ++i)
+            s->token_history[kv_pos_start + i] = -1;
+        if (kv_pos_start + n_tokens > s->history_len)
+            s->history_len = kv_pos_start + n_tokens;
+    }
+    s->history_valid_from = kv_pos_start + n_tokens;
+
+    const uint32_t chunk_max = (uint32_t)asi_runtime_config()->batch_chunk_max;
+    uint32_t done = 0u;
+    asi_pool_begin(s->pool);
+    while (done < n_tokens)
+    {
+        if (cancel_flag && *cancel_flag)
+        {
+            asi_pool_end(s->pool);
+            return -2;
+        }
+        uint32_t B = n_tokens - done;
+        if (B > chunk_max) B = chunk_max;
+        int is_last = (done + B == n_tokens);
+        int rc = qwen35_forward_chunk_ex(
+            s, NULL, B, kv_pos_start + done,
+            (is_last && out_last_logits != NULL) ? 1 : 0, 0,
+            out_last_logits, NULL,
+            embds + (size_t)done * H,
+            mrope_pos_3d ? (mrope_pos_3d + (size_t)done * 3u) : NULL,
+            mrope_sections, mrope_flags, cancel_flag);
+        if (rc != 0)
+        {
+            asi_pool_end(s->pool);
+            return rc;
+        }
+        done += B;
+    }
+    asi_pool_end(s->pool);
+
+    if (next_rope_pos > 0u)
+    {
+        s->mrope_pos_delta = (int64_t)next_rope_pos - (int64_t)(kv_pos_start + n_tokens);
+    }
+    else if (mrope_pos_3d != NULL)
+    {
+        uint32_t max_p = 0u;
+        size_t n_coords = (size_t)n_tokens * 3u;
+        for (size_t k = 0; k < n_coords; ++k)
+        {
+            if (mrope_pos_3d[k] > max_p) max_p = mrope_pos_3d[k];
+        }
+        s->mrope_pos_delta = (int64_t)(max_p + 1u) - (int64_t)(kv_pos_start + n_tokens);
+    }
+    return 0;
 }
 
 const AsiArchHandler g_asi_arch_hybrid_qwen35 = {
@@ -4483,6 +6172,10 @@ const AsiArchHandler g_asi_arch_hybrid_qwen35 = {
     .restore_prefix = qwen35_restore_prefix,
     .save_prefix_file = qwen35_save_prefix_file,
     .load_prefix_file = qwen35_load_prefix_file,
+    .forward_embd = qwen35_forward_embd,
+    .get_rope_delta = qwen35_get_rope_delta,
+    .set_rope_delta = qwen35_set_rope_delta,
+    .set_calib_hook = qwen35_set_calib_hook,
 };
 
 /* g_asi_arch_dense_transformer provided by src/asi_dense.c */
@@ -4662,6 +6355,7 @@ int qwen35_sc_restore_state(AsiArchSession *s,
     s->spec_start_pos = 0;
     s->spec_consec_misses = 0;
     s->spec_cooldown = 0;
+    s->mrope_pos_delta = 0;
     s->fail_gen++;
     if (s->fail_gen == 0)
     {
@@ -4703,6 +6397,16 @@ uint32_t qwen35_sc_get_kv_dirty_from(const AsiArchSession *s)
 void qwen35_sc_mark_kv_clean(AsiArchSession *s, uint32_t pos)
 {
     if (s) s->kv_dirty_from = pos;
+}
+
+int64_t qwen35_sc_get_rope_delta(const AsiArchSession *s)
+{
+    return s ? s->mrope_pos_delta : 0;
+}
+
+void qwen35_sc_set_rope_delta(AsiArchSession *s, int64_t delta)
+{
+    if (s) s->mrope_pos_delta = delta;
 }
 
 

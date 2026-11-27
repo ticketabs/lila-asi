@@ -58,5 +58,7 @@ int qwen35_sc_get_history(const AsiArchSession *s,
                           uint32_t *out_valid_from);
 uint32_t qwen35_sc_get_kv_dirty_from(const AsiArchSession *s);
 void qwen35_sc_mark_kv_clean(AsiArchSession *s, uint32_t pos);
+int64_t qwen35_sc_get_rope_delta(const AsiArchSession *s);
+void qwen35_sc_set_rope_delta(AsiArchSession *s, int64_t delta);
 
 #endif /* LILA_ASI_SC_INTERNAL_H */

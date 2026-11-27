@@ -4,13 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lila-asi"
-version = "2.4.0"
-description = "Lila ASI v2.4 Standalone C11 + Python Inference Runtime (Universal 8-Quant, Sieve lm_head, E05 Sparse Grammar, E06 State Tree)"
+version = "2.6.0"
+description = "Lila ASI v2.6 Standalone C11 + Python Inference Runtime (Universal 8-Quant, Sieve lm_head, E05 Sparse Grammar, E06 State Tree, Universal .asiv Vision, Ed25519)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "AGPL-3.0-only"}
 authors = [{name = "TicketLabs (Harboria Labs)"}]
 dependencies = []
+
+[project.optional-dependencies]
+vision = ["numpy>=1.24", "Pillow>=10.0"]
 
 [tool.setuptools]
 package-dir = {"" = "python"}

@@ -1,5 +1,5 @@
 /*
- * asi_v2_cli.c — Standalone C11 Command-Line Runner for ASI v2.4 Cartridges
+ * asi_v2_cli.c — Standalone C11 Command-Line Runner for ASI v2.6 Cartridges
  *
  * Works like `llama-cli` for `.asi` cartridges using `liblila_asi.so`:
  *   ./lila-asi-cli <model.asi> --info
@@ -13,6 +13,8 @@
 #endif
 
 #include "lila_asi.h"
+#include "asi_platform.h"
+#include "asi_cpu.h"
 #include "asi_state_centric.h"
 #include "asi_grammar_sparse.h"
 
@@ -23,13 +25,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 static double now_ms(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec * 1e-6;
+    return (double)asi_monotonic_ns() * 1e-6;
 }
 
 static const char *arch_id_name(uint32_t arch_id)
@@ -63,6 +62,8 @@ static const char *section_type_name(uint32_t stype)
         case ASI_SEC_ADAPTERS:        return "ADAPTERS";
         case ASI_SEC_RUNTIME_HINTS:   return "RUNTIME_HINTS";
         case ASI_SEC_SIGNATURE:       return "SIGNATURE";
+        case ASI_SEC_GRAPH:           return "GRAPH";
+        case ASI_SEC_PAIRING:         return "PAIRING";
         default:                      return "OTHER";
     }
 }
@@ -72,26 +73,26 @@ static void apply_mode_env(const char *mode)
     if (!mode || !mode[0]) return;
     if (strcmp(mode, "fast") == 0)
     {
-        setenv("LILA_ASI_MODE", "fast", 1);
-        setenv("LILA_ASI_LMHEAD_MODE", "1bit1024", 1);
-        setenv("LILA_ASI_LMHEAD_K", "2048", 1);
-        setenv("LILA_ASI_SPECULATIVE", "1", 1);
-        setenv("LILA_ASI_SPEC_GATE", "1", 1);
+        asi_setenv("LILA_ASI_MODE", "fast");
+        asi_setenv("LILA_ASI_LMHEAD_MODE", "1bit1024");
+        asi_setenv("LILA_ASI_LMHEAD_K", "2048");
+        asi_setenv("LILA_ASI_SPECULATIVE", "1");
+        asi_setenv("LILA_ASI_SPEC_GATE", "1");
     }
     else if (strcmp(mode, "balanced") == 0)
     {
-        setenv("LILA_ASI_MODE", "balanced", 1);
-        setenv("LILA_ASI_LMHEAD_MODE", "2bit1024", 1);
-        setenv("LILA_ASI_LMHEAD_K", "1024", 1);
-        setenv("LILA_ASI_SPECULATIVE", "1", 1);
-        setenv("LILA_ASI_SPEC_GATE", "1", 1);
+        asi_setenv("LILA_ASI_MODE", "balanced");
+        asi_setenv("LILA_ASI_LMHEAD_MODE", "2bit1024");
+        asi_setenv("LILA_ASI_LMHEAD_K", "1024");
+        asi_setenv("LILA_ASI_SPECULATIVE", "1");
+        asi_setenv("LILA_ASI_SPEC_GATE", "1");
     }
     else if (strcmp(mode, "exact") == 0)
     {
-        setenv("LILA_ASI_MODE", "exact", 1);
-        setenv("LILA_ASI_LMHEAD_MODE", "off", 1);
-        setenv("LILA_ASI_SPECULATIVE", "0", 1);
-        setenv("LILA_ASI_SPEC_GATE", "0", 1);
+        asi_setenv("LILA_ASI_MODE", "exact");
+        asi_setenv("LILA_ASI_LMHEAD_MODE", "off");
+        asi_setenv("LILA_ASI_SPECULATIVE", "0");
+        asi_setenv("LILA_ASI_SPEC_GATE", "0");
     }
 }
 
@@ -188,7 +189,7 @@ static int load_simple_tokenizer(const LilaAsiModel *model, uint32_t vocab_size,
     const char *json = (const char *)sec_ptr;
     const char *end = json + sec_size;
 
-    const char *tok_key = memmem(json, sec_size, "\"tokens\":[", 10);
+    const char *tok_key = (const char *)asi_memmem(json, sec_size, "\"tokens\":[", 10);
     if (!tok_key) return -1;
 
     out_tok->raw_pieces = (char **)calloc(vocab_size, sizeof(char *));
@@ -371,16 +372,34 @@ static uint32_t simple_encode(const SimpleTokenizer *tok,
     return count;
 }
 
+static int parse_hex_pubkey(const char *hex, uint8_t out_pk[32])
+{
+    if (!hex || strlen(hex) != 64) return -1;
+    for (size_t i = 0; i < 32; ++i)
+    {
+        unsigned int v = 0;
+        if (!isxdigit((unsigned char)hex[i * 2]) ||
+            !isxdigit((unsigned char)hex[i * 2 + 1]) ||
+            sscanf(hex + i * 2, "%2x", &v) != 1)
+            return -1;
+        out_pk[i] = (uint8_t)v;
+    }
+    return 0;
+}
+
 static void print_usage(const char *prog)
 {
-    printf("Lila ASI v2.4 Standalone C11 CLI (Sieve + E05 Grammar-Sparse + E06 State-Centric)\n\n");
+    printf("Lila ASI v2.6 Standalone C11 CLI (Sieve + E05 Grammar-Sparse + Anchor + Vision + Torrent)\n\n");
     printf("Usage:\n");
     printf("  %s <model.asi> --info\n", prog);
+    printf("  %s <model.asi> --verify [--pubkey <64-hex>]\n", prog);
     printf("  %s <model.asi> --bench [-t threads] [-n tokens] [--mode fast|balanced|exact]\n", prog);
     printf("  %s <model.asi> -p \"<prompt>\" [-n max_tokens] [-t threads] [--temp T] [--mode fast|balanced|exact] [--raw-prompt]\n", prog);
     printf("  %s <model.asi> --tokens \"id1,id2,...\" [-n max_tokens] [-t threads] [--temp T]\n\n", prog);
     printf("Options:\n");
     printf("  --info                     Inspect .asi v2 cartridge header, architecture, and sections\n");
+    printf("  --verify                   Verify Ed25519 signature and section integrity\n");
+    printf("  --pubkey <64-hex>          Require signature from this 32-byte Ed25519 public key\n");
     printf("  --bench                    Run prefill + decode speed & confidence benchmark\n");
     printf("  -p, --prompt <text>        Prompt text to evaluate and generate from\n");
     printf("  --raw-prompt               Do not wrap prompt in ChatML (<|im_start|>user...<|im_start|>assistant)\n");
@@ -390,6 +409,35 @@ static void print_usage(const char *prog)
     printf("  --ctx <int>                Max context length (default: 2048)\n");
     printf("  --temp <float>             Sampling temperature, <=0 for greedy (default: 0.0)\n");
     printf("  --mode <fast|balanced|exact> ASI preset mode (default: fast)\n");
+}
+
+static int cmd_verify(LilaAsiModel *model, const char *path, const char *pubkey_hex)
+{
+    uint8_t trusted_pk[32];
+    const uint8_t *pk_ptr = NULL;
+    if (pubkey_hex && pubkey_hex[0] != '\0')
+    {
+        if (parse_hex_pubkey(pubkey_hex, trusted_pk) != 0)
+        {
+            fprintf(stderr, "Invalid --pubkey (expected 64 hex chars).\n");
+            return 1;
+        }
+        pk_ptr = trusted_pk;
+    }
+    AsiV2SignatureInfo info;
+    char err_buf[256] = {0};
+    if (lila_asi_verify_signature(model, pk_ptr, &info, err_buf, sizeof(err_buf)) != 0)
+    {
+        fprintf(stderr, "SIGNATURE VERIFY FAILED (%s): %s\n", path, err_buf);
+        return 1;
+    }
+    printf("SIGNATURE VERIFIED: %s\n", path);
+    printf("Publisher       : %s\n", info.publisher);
+    printf("Signed At Unix  : %llu\n", (unsigned long long)info.signed_at_unix);
+    printf("Public Key      : ");
+    for (int i = 0; i < 32; ++i) printf("%02x", info.public_key[i]);
+    printf("\n");
+    return 0;
 }
 
 static int cmd_info(LilaAsiModel *model, const char *path, const char *mode)
@@ -402,6 +450,9 @@ static int cmd_info(LilaAsiModel *model, const char *path, const char *mode)
         return 1;
     }
 
+    char cpu_buf[128] = {0};
+    lila_asi_cpu_info(cpu_buf, sizeof(cpu_buf));
+
     printf("=== ASI v2 Cartridge Inspection ===\n");
     printf("File            : %s\n", path);
     printf("Total Size      : %.2f MiB (%llu bytes)\n",
@@ -409,11 +460,24 @@ static int cmd_info(LilaAsiModel *model, const char *path, const char *mode)
            (unsigned long long)hdr.total_size);
     printf("Format Version  : ASI v%u (magic=0x%08X, page=%u B)\n",
            hdr.version, hdr.magic, ASI_V2_PAGE_SIZE);
+    printf("Runtime CPU     : %s\n", cpu_buf);
     printf("Architecture    : %s (arch_id=%u)\n", arch_id_name(cfg.arch_id), cfg.arch_id);
     printf("Active Preset   : %s\n", mode);
     printf("Identity SHA192 : ");
     for (int i = 0; i < 24; ++i) printf("%02x", hdr.identity_hash[i]);
-    printf("\n\n");
+    printf("\n");
+    AsiV2SignatureInfo sinfo;
+    char serr[128] = {0};
+    if (lila_asi_verify_signature(model, NULL, &sinfo, serr, sizeof(serr)) == 0)
+    {
+        printf("Signature       : VERIFIED (publisher=%s, pubkey=", sinfo.publisher);
+        for (int i = 0; i < 32; ++i) printf("%02x", sinfo.public_key[i]);
+        printf(")\n\n");
+    }
+    else
+    {
+        printf("Signature       : %s\n\n", (hdr.flags & ASI_V2_FLAG_HAS_SIGNATURE) ? serr : "unsigned");
+    }
 
     printf("--- Model Hyperparameters ---\n");
     printf("Layers          : %u\n", cfg.n_layers);
@@ -454,8 +518,10 @@ int main(int argc, char **argv)
 
     const char *asi_path = argv[1];
     bool do_info = false;
+    bool do_verify = false;
     bool do_bench = false;
     bool raw_prompt = false;
+    const char *verify_pubkey = NULL;
     char prompt_buf[2048] = {0};
     const char *prompt_text = NULL;
     const char *tokens_csv = NULL;
@@ -468,6 +534,8 @@ int main(int argc, char **argv)
     for (int i = 2; i < argc; ++i)
     {
         if (strcmp(argv[i], "--info") == 0) do_info = true;
+        else if (strcmp(argv[i], "--verify") == 0) do_verify = true;
+        else if (strcmp(argv[i], "--pubkey") == 0 && i + 1 < argc) verify_pubkey = argv[++i];
         else if (strcmp(argv[i], "--bench") == 0) do_bench = true;
         else if (strcmp(argv[i], "--raw-prompt") == 0) raw_prompt = true;
         else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) && i + 1 < argc)
@@ -509,6 +577,13 @@ int main(int argc, char **argv)
     {
         fprintf(stderr, "Error opening %s: %s\n", asi_path, err_buf);
         return 1;
+    }
+
+    if (do_verify)
+    {
+        int rc = cmd_verify(model, asi_path, verify_pubkey);
+        lila_asi_close(model);
+        return rc;
     }
 
     if (do_info)
@@ -574,7 +649,7 @@ int main(int argc, char **argv)
         }
         double t_dec_ms = now_ms() - t_dec0;
 
-        printf("=== ASI v2.4 Native Benchmark ===\n");
+        printf("=== ASI v2.6 Native Benchmark (Sieve + Anchor + Torrent) ===\n");
         printf("Cartridge       : %s\n", asi_path);
         printf("Preset Mode     : %s (threads=%u, ctx=%u)\n", mode, n_threads, max_ctx);
         printf("Open + Sieve    : %.1f ms (mmap=%.1f ms, session=%.1f ms)\n",
@@ -600,13 +675,14 @@ int main(int argc, char **argv)
 
     if (tokens_csv)
     {
-        char *copy = strdup(tokens_csv);
+        char *copy = (char *)malloc(strlen(tokens_csv) + 1);
+        if (copy) strcpy(copy, tokens_csv);
         char *save = NULL;
-        char *part = strtok_r(copy, ",", &save);
+        char *part = copy ? asi_strtok_r(copy, ",", &save) : NULL;
         while (part && n_prompt < 2048)
         {
             prompt_ids[n_prompt++] = (int32_t)atoi(part);
-            part = strtok_r(NULL, ",", &save);
+            part = asi_strtok_r(NULL, ",", &save);
         }
         free(copy);
     }
@@ -698,7 +774,7 @@ int main(int argc, char **argv)
         }
     }
     double t_dec_ms = now_ms() - t_dec0;
-    printf("\n\n[ASI v2.4 | mode=%s | prefill=%u tok in %.1f ms (%.1f tok/s) | decode=%u tok in %.1f ms (%.2f tok/s)]\n",
+    printf("\n\n[ASI v2.6 | mode=%s | prefill=%u tok in %.1f ms (%.1f tok/s) | decode=%u tok in %.1f ms (%.2f tok/s)]\n",
            mode,
            n_prompt, t_pf_ms, (double)n_prompt * 1000.0 / (t_pf_ms > 0.0 ? t_pf_ms : 1.0),
            n_gen, t_dec_ms, (double)n_gen * 1000.0 / (t_dec_ms > 0.0 ? t_dec_ms : 1.0));

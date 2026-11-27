@@ -3,6 +3,7 @@
 #include "asi_dense.h"
 #include "lila_lm_head_candidate.h"
 #include "asi_sc_internal.h"
+#include "q4k.h"
 
 typedef struct {
     const AsiV2Cartridge *cart;
@@ -21,8 +22,11 @@ static int dense_lhc_hook_cb(void *user_ctx,
     const uint8_t *w = ctx->cart->weights_data + lm_head->data_offset;
     return lila_lhc_forward_pool(ctx->idx, ctx->ws, NULL, NULL, w, x_norm, out_logits, ctx->fp32_ref);
 }
+#include "asi_cpu.h"
 #include <math.h>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -102,6 +106,58 @@ int lila_asi_get_section(const LilaAsiModel *model,
     return 0;
 }
 
+int lila_asi_export_sieve_section(const LilaAsiModel *model,
+                                  const char *mode_str,
+                                  uint8_t *out_buf,
+                                  size_t out_cap,
+                                  size_t *out_written)
+{
+    if (!model || !out_written) return -1;
+    const AsiV2Cartridge *cart = &model->cart;
+    const AsiV2ModelConfig *c = &cart->config;
+    const AsiV2TensorEntry *lm_head = asi_v2_find_tensor(cart, "output.weight");
+    if (!lm_head) lm_head = asi_v2_find_tensor(cart, "token_embd.weight");
+    const AsiV2TensorEntry *out_norm = asi_v2_find_tensor(cart, "output_norm.weight");
+    if (!lm_head || !out_norm || !cart->weights_data) return -1;
+
+    LilaLhcMode mode = (mode_str && mode_str[0]) ? lila_lhc_parse_mode(mode_str) : LILA_LHC_MODE_1BIT_1024;
+    if (mode == LILA_LHC_MODE_OFF) return -1;
+
+    int is_repacked = (lm_head->layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK) ? 1 : 0;
+    const uint8_t *w_ptr = cart->weights_data + lm_head->data_offset;
+    const float *norm_ptr = (out_norm->quant_type == 0)
+        ? (const float *)(cart->weights_data + out_norm->data_offset)
+        : NULL;
+
+    LilaLhcIndex *idx = lila_lhc_build_quant_pool(
+        mode, w_ptr, lm_head->quant_type, is_repacked,
+        c->vocab_size, c->hidden_size, norm_ptr, NULL, NULL);
+    if (!idx) return -1;
+
+    int rc = lila_lhc_serialize_section(idx, out_buf, out_cap, out_written);
+    lila_lhc_free(idx);
+    return rc;
+}
+
+int lila_asi_verify_signature(const LilaAsiModel *model,
+                              const uint8_t *trusted_pubkey_32,
+                              AsiV2SignatureInfo *out_info,
+                              char *err_buf,
+                              size_t err_cap)
+{
+    if (!model)
+    {
+        if (err_buf && err_cap > 0) snprintf(err_buf, err_cap, "null model");
+        return -1;
+    }
+    return asi_v2_verify_signature(&model->cart, trusted_pubkey_32, out_info, err_buf, err_cap);
+}
+
+void lila_asi_cpu_info(char *buf, size_t cap)
+{
+    asi_cpu_feature_string(buf, cap);
+}
+
 LilaAsiSession *lila_asi_session_create(LilaAsiModel *model,
                                          uint32_t max_ctx,
                                          uint32_t n_threads,
@@ -114,12 +170,14 @@ LilaAsiSession *lila_asi_session_create(LilaAsiModel *model,
     s->model = model;
     if (n_threads == 0)
     {
-        int procs = omp_get_num_procs();
+        int procs = asi_num_procs();
         n_threads = (procs > 2) ? (uint32_t)(procs / 2) : (uint32_t)procs;
         if (n_threads == 0) n_threads = 1;
     }
     s->n_threads = n_threads;
+#ifdef _OPENMP
     omp_set_num_threads((int)n_threads);
+#endif
 
     if (model->handler->init_session(&model->cart, max_ctx, n_threads,
                                      &s->arch_session, err_buf, err_cap) != 0)
@@ -139,14 +197,14 @@ LilaAsiSession *lila_asi_session_create(LilaAsiModel *model,
         uint32_t preset_k = 2048u;
         if (preset_env && preset_env[0] != '\0')
         {
-            if (strcasecmp(preset_env, "balanced") == 0)
+            if (asi_strcasecmp(preset_env, "balanced") == 0)
             {
                 preset_mode = (!fp32_ref && cfg->vocab_size > 4096u && cfg->hidden_size == 1024u)
                                   ? LILA_LHC_MODE_2BIT_1024
                                   : LILA_LHC_MODE_OFF;
                 preset_k = 1024u;
             }
-            else if (strcasecmp(preset_env, "exact") == 0)
+            else if (asi_strcasecmp(preset_env, "exact") == 0)
             {
                 preset_mode = LILA_LHC_MODE_OFF;
             }
@@ -273,7 +331,9 @@ int lila_asi_eval_token(LilaAsiSession *session,
                         float *out_logits)
 {
     if (!session || !session->model || !session->model->handler) return -1;
+#ifdef _OPENMP
     omp_set_num_threads((int)session->n_threads);
+#endif
     if (session->model->handler->forward_speculative)
     {
         return session->model->handler->forward_speculative(
@@ -289,9 +349,88 @@ int lila_asi_eval_batch(LilaAsiSession *session,
                         float *out_last_logits)
 {
     if (!session || !session->model || !session->model->handler) return -1;
+#ifdef _OPENMP
     omp_set_num_threads((int)session->n_threads);
+#endif
     return session->model->handler->forward_batch(
         session->arch_session, token_ids, n_tokens, pos_start, out_last_logits);
+}
+
+int lila_asi_eval_embd(LilaAsiSession *session,
+                       const float *embds,
+                       uint32_t n_tokens,
+                       uint32_t kv_pos_start,
+                       const uint32_t *mrope_pos_3d,
+                       const uint32_t mrope_sections[3],
+                       uint32_t mrope_flags,
+                       uint32_t next_rope_pos,
+                       const volatile int *cancel_flag,
+                       float *out_last_logits)
+{
+    if (!session || !session->model || !session->model->handler ||
+        !session->model->handler->forward_embd)
+    {
+        return -1;
+    }
+#ifdef _OPENMP
+    omp_set_num_threads((int)session->n_threads);
+#endif
+    return session->model->handler->forward_embd(
+        session->arch_session, embds, n_tokens, kv_pos_start,
+        mrope_pos_3d, mrope_sections, mrope_flags, next_rope_pos,
+        cancel_flag, out_last_logits);
+}
+
+int64_t lila_asi_session_get_rope_delta(const LilaAsiSession *session)
+{
+    if (!session || !session->model || !session->model->handler ||
+        !session->model->handler->get_rope_delta)
+    {
+        return 0;
+    }
+    return session->model->handler->get_rope_delta(session->arch_session);
+}
+
+void lila_asi_session_set_rope_delta(LilaAsiSession *session, int64_t delta)
+{
+    if (!session || !session->model || !session->model->handler ||
+        !session->model->handler->set_rope_delta)
+    {
+        return;
+    }
+    session->model->handler->set_rope_delta(session->arch_session, delta);
+}
+
+uint32_t lila_asi_build_mrope_grid(uint32_t rope_pos_start,
+                                   const uint32_t grid_thw[3],
+                                   uint32_t *out_pos_3d,
+                                   size_t out_cap_u32)
+{
+    if (!grid_thw || !out_pos_3d) return 0u;
+    uint32_t T = grid_thw[0];
+    uint32_t H = grid_thw[1];
+    uint32_t W = grid_thw[2];
+    if (T == 0u || H == 0u || W == 0u) return 0u;
+    size_t needed = (size_t)T * (size_t)H * (size_t)W * 3u;
+    if (needed > out_cap_u32) return 0u;
+
+    size_t k = 0u;
+    for (uint32_t t = 0; t < T; ++t)
+    {
+        for (uint32_t r = 0; r < H; ++r)
+        {
+            for (uint32_t c = 0; c < W; ++c)
+            {
+                out_pos_3d[k++] = rope_pos_start + t;
+                out_pos_3d[k++] = rope_pos_start + r;
+                out_pos_3d[k++] = rope_pos_start + c;
+            }
+        }
+    }
+    uint32_t max_dim = T;
+    if (H > max_dim) max_dim = H;
+    if (W > max_dim) max_dim = W;
+    return rope_pos_start + max_dim;
 }
 
 typedef struct {
@@ -449,4 +588,317 @@ AsiStateTree *lila_asi_sc_ensure_state_tree(LilaAsiSession *session)
 const AsiStateTree *lila_asi_sc_get_state_tree(const LilaAsiSession *session)
 {
     return session ? session->state_tree : NULL;
+}
+
+void lila_asi_session_set_calib_hook(LilaAsiSession *session,
+                                     LilaAsiCalibHookFn fn,
+                                     void *user_ctx)
+{
+    if (!session || !session->model || !session->model->handler ||
+        !session->model->handler->set_calib_hook)
+    {
+        return;
+    }
+    session->model->handler->set_calib_hook(session->arch_session, fn, user_ctx);
+}
+
+int lila_asi_dequant_f32(const uint8_t *src,
+                         uint32_t quant_type,
+                         uint32_t layout_flags,
+                         int cols,
+                         int rows,
+                         float *dst_f32)
+{
+    if (!src || !dst_f32 || cols <= 0 || rows <= 0) return -1;
+    if (!lila_quant_is_supported(quant_type)) return -1;
+    int is_repacked = (layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK) ? 1 : 0;
+    int is_col_major = (layout_flags & ASI_TENSOR_LAYOUT_COL_MAJOR) ? 1 : 0;
+    int r;
+    #pragma omp parallel for schedule(static) if(rows >= 16)
+    for (r = 0; r < rows; ++r)
+    {
+        lila_dequant_row_at(dst_f32 + (size_t)r * (size_t)cols, src, r, cols, rows,
+                            quant_type, is_repacked, is_col_major);
+    }
+    return 0;
+}
+
+static void asi_quant_group64_q4r(const float *w, int avail, int search_steps,
+                                  uint16_t *out_d, uint8_t *out_qs)
+{
+    float buf[Q4_REPACK_GROUP_SIZE];
+    float amax = 0.0f;
+    for (int i = 0; i < avail; ++i)
+    {
+        buf[i] = w[i];
+        float a = fabsf(w[i]);
+        if (a > amax) amax = a;
+    }
+    for (int i = avail; i < Q4_REPACK_GROUP_SIZE; ++i) buf[i] = 0.0f;
+
+    if (amax == 0.0f)
+    {
+        *out_d = 0u;
+        memset(out_qs, 0x88, 32);
+        return;
+    }
+
+    int best_q[Q4_REPACK_GROUP_SIZE];
+    uint16_t best_d = 0u;
+    double best_err = 1e300;
+
+    float s0 = amax / 7.5f;
+    int steps = (search_steps > 1) ? search_steps : 1;
+    for (int si = 0; si < steps; ++si)
+    {
+        float mul = (steps == 1) ? 1.0f : (0.72f + 0.32f * (float)si / (float)(steps - 1));
+        float s_try = s0 * mul;
+        float inv_s = (s_try > 0.0f) ? (1.0f / s_try) : 0.0f;
+        int q_cur[Q4_REPACK_GROUP_SIZE];
+        double num = 0.0, den = 0.0;
+        for (int i = 0; i < avail; ++i)
+        {
+            int q = (int)lrintf(buf[i] * inv_s);
+            if (q < -8) q = -8;
+            else if (q > 7) q = 7;
+            q_cur[i] = q;
+            num += (double)buf[i] * (double)q;
+            den += (double)q * (double)q;
+        }
+        for (int i = avail; i < Q4_REPACK_GROUP_SIZE; ++i) q_cur[i] = 0;
+
+        float s_opt = (steps > 1 && den > 0.0) ? (float)(num / den) : s_try;
+        if (s_opt <= 0.0f) s_opt = s_try;
+        uint16_t d16 = fp32_to_fp16(s_opt);
+        float d_val = fp16_to_fp32(d16);
+        if (steps > 1 && d_val > 0.0f)
+        {
+            /* Re-snap codes to the fp16-quantized scale */
+            float inv_dv = 1.0f / d_val;
+            for (int i = 0; i < avail; ++i)
+            {
+                int q = (int)lrintf(buf[i] * inv_dv);
+                if (q < -8) q = -8;
+                else if (q > 7) q = 7;
+                q_cur[i] = q;
+            }
+        }
+        double err = 0.0;
+        for (int i = 0; i < avail; ++i)
+        {
+            double diff = (double)buf[i] - (double)d_val * (double)q_cur[i];
+            err += diff * diff;
+        }
+        if (err < best_err)
+        {
+            best_err = err;
+            best_d = d16;
+            memcpy(best_q, q_cur, sizeof(best_q));
+        }
+    }
+
+    *out_d = best_d;
+    for (int l = 0; l < 32; ++l)
+    {
+        uint8_t u0 = (uint8_t)(best_q[l] + 8);
+        uint8_t u1 = (uint8_t)(best_q[l + 32] + 8);
+        out_qs[l] = (uint8_t)((u0 & 0x0Fu) | ((u1 & 0x0Fu) << 4));
+    }
+}
+
+int lila_asi_requant_q4_repack(const float *src_f32,
+                               int rows,
+                               int cols,
+                               int col_major,
+                               int search_steps,
+                               uint8_t *dst)
+{
+    if (!src_f32 || !dst || rows <= 0 || cols <= 0) return -1;
+    if (!col_major)
+    {
+        int n_blk = (cols + Q4_REPACK_GROUP_SIZE - 1) / Q4_REPACK_GROUP_SIZE;
+        size_t row_bytes = (size_t)n_blk * Q4_REPACK_BLOCK_SIZE;
+        int r;
+        #pragma omp parallel for schedule(static) if(rows >= 16)
+        for (r = 0; r < rows; ++r)
+        {
+            const float *row_in = src_f32 + (size_t)r * (size_t)cols;
+            uint8_t *row_out = dst + (size_t)r * row_bytes;
+            for (int b = 0; b < n_blk; ++b)
+            {
+                int base = b * Q4_REPACK_GROUP_SIZE;
+                int avail = cols - base;
+                if (avail > Q4_REPACK_GROUP_SIZE) avail = Q4_REPACK_GROUP_SIZE;
+                uint16_t d16 = 0;
+                uint8_t *blk_out = row_out + (size_t)b * Q4_REPACK_BLOCK_SIZE;
+                asi_quant_group64_q4r(row_in + base, avail, search_steps, &d16, blk_out + 2);
+                memcpy(blk_out, &d16, 2);
+            }
+        }
+        return 0;
+    }
+
+    int n_blk = (rows + Q4_REPACK_GROUP_SIZE - 1) / Q4_REPACK_GROUP_SIZE;
+    size_t col_bytes = (size_t)n_blk * Q4_REPACK_BLOCK_SIZE;
+    int c;
+    #pragma omp parallel for schedule(static) if(cols >= 16)
+    for (c = 0; c < cols; ++c)
+    {
+        uint8_t *col_out = dst + (size_t)c * col_bytes;
+        float grp[Q4_REPACK_GROUP_SIZE];
+        for (int b = 0; b < n_blk; ++b)
+        {
+            int base = b * Q4_REPACK_GROUP_SIZE;
+            int avail = rows - base;
+            if (avail > Q4_REPACK_GROUP_SIZE) avail = Q4_REPACK_GROUP_SIZE;
+            for (int i = 0; i < avail; ++i)
+            {
+                grp[i] = src_f32[(size_t)(base + i) * (size_t)cols + (size_t)c];
+            }
+            uint16_t d16 = 0;
+            uint8_t *blk_out = col_out + (size_t)b * Q4_REPACK_BLOCK_SIZE;
+            asi_quant_group64_q4r(grp, avail, search_steps, &d16, blk_out + 2);
+            memcpy(blk_out, &d16, 2);
+        }
+    }
+    return 0;
+}
+
+static void asi_quant_group128_q3(const float *w, int avail, int search_steps,
+                                  uint16_t *out_step, int q3_out[Q3_SPLITLUT_BLK_COLS])
+{
+    float buf[Q3_SPLITLUT_BLK_COLS];
+    double ss = 0.0;
+    for (int i = 0; i < avail; ++i)
+    {
+        buf[i] = w[i];
+        ss += (double)w[i] * (double)w[i];
+    }
+    for (int i = avail; i < Q3_SPLITLUT_BLK_COLS; ++i) buf[i] = 0.0f;
+
+    if (ss == 0.0)
+    {
+        *out_step = 0u;
+        for (int i = 0; i < Q3_SPLITLUT_BLK_COLS; ++i) q3_out[i] = 3;
+        return;
+    }
+
+    float stdw = (float)sqrt(ss / (double)(avail > 0 ? avail : 1)) + 1e-12f;
+    float step0 = 0.5860f * stdw;
+    int steps = (search_steps > 1) ? search_steps : 1;
+    uint16_t best_step = 0u;
+    double best_err = 1e300;
+    int best_q[Q3_SPLITLUT_BLK_COLS];
+
+    for (int si = 0; si < steps; ++si)
+    {
+        float mul = (steps == 1) ? 1.0f : (0.72f + 0.52f * (float)si / (float)(steps - 1));
+        float st_try = step0 * mul;
+        float inv_st = (st_try > 0.0f) ? (1.0f / st_try) : 0.0f;
+        int q_cur[Q3_SPLITLUT_BLK_COLS];
+        double num = 0.0, den = 0.0;
+        for (int i = 0; i < avail; ++i)
+        {
+            int q = (int)floorf(buf[i] * inv_st + 4.0f);
+            if (q < 0) q = 0;
+            else if (q > 7) q = 7;
+            q_cur[i] = q;
+            double vq = (double)q - 3.5;
+            num += (double)buf[i] * vq;
+            den += vq * vq;
+        }
+        for (int i = avail; i < Q3_SPLITLUT_BLK_COLS; ++i) q_cur[i] = 3;
+
+        float st_opt = (steps > 1 && den > 0.0) ? (float)(num / den) : st_try;
+        if (st_opt <= 0.0f) st_opt = st_try;
+        uint16_t st16 = fp32_to_fp16(st_opt);
+        float st_val = fp16_to_fp32(st16);
+        if (steps > 1 && st_val > 0.0f)
+        {
+            float inv_sv = 1.0f / st_val;
+            for (int i = 0; i < avail; ++i)
+            {
+                int q = (int)floorf(buf[i] * inv_sv + 4.0f);
+                if (q < 0) q = 0;
+                else if (q > 7) q = 7;
+                q_cur[i] = q;
+            }
+        }
+        double err = 0.0;
+        for (int i = 0; i < avail; ++i)
+        {
+            double diff = (double)buf[i] - (double)st_val * ((double)q_cur[i] - 3.5);
+            err += diff * diff;
+        }
+        if (err < best_err)
+        {
+            best_err = err;
+            best_step = st16;
+            memcpy(best_q, q_cur, sizeof(best_q));
+        }
+    }
+
+    *out_step = best_step;
+    memcpy(q3_out, best_q, sizeof(best_q));
+}
+
+int lila_asi_requant_q3_splitlut(const float *src_f32,
+                                 int rows,
+                                 int cols,
+                                 int search_steps,
+                                 uint8_t *dst)
+{
+    if (!src_f32 || !dst || rows <= 0 || cols <= 0) return -1;
+    int n_tiles = (rows + Q3_SPLITLUT_TILE_ROWS - 1) / Q3_SPLITLUT_TILE_ROWS;
+    int n_blk128 = (cols + Q3_SPLITLUT_BLK_COLS - 1) / Q3_SPLITLUT_BLK_COLS;
+    size_t tile_bytes = (size_t)n_blk128 * Q3_SPLITLUT_BLK_BYTES;
+    memset(dst, 0, (size_t)n_tiles * tile_bytes);
+
+    int tile;
+    #pragma omp parallel for schedule(static) if(n_tiles >= 2)
+    for (tile = 0; tile < n_tiles; ++tile)
+    {
+        int r_base = tile * Q3_SPLITLUT_TILE_ROWS;
+        int valid = rows - r_base;
+        if (valid > Q3_SPLITLUT_TILE_ROWS) valid = Q3_SPLITLUT_TILE_ROWS;
+        uint8_t *tp = dst + (size_t)tile * tile_bytes;
+
+        for (int lr = 0; lr < valid; ++lr)
+        {
+            int r = r_base + lr;
+            int bo = lr & 31;
+            int sh = (lr >= 32) ? 4 : 0;
+            const float *row_in = src_f32 + (size_t)r * (size_t)cols;
+
+            for (int blk = 0; blk < n_blk128; ++blk)
+            {
+                int base = blk * Q3_SPLITLUT_BLK_COLS;
+                int avail = cols - base;
+                if (avail > Q3_SPLITLUT_BLK_COLS) avail = Q3_SPLITLUT_BLK_COLS;
+                uint16_t sc16 = 0;
+                int q3[Q3_SPLITLUT_BLK_COLS];
+                asi_quant_group128_q3(row_in + base, avail, search_steps, &sc16, q3);
+
+                uint8_t *bp_h = tp + (size_t)blk * Q3_SPLITLUT_BLK_BYTES;
+                uint8_t *bp_l = bp_h + Q3_SPLITLUT_BLK_HI2_BYTES;
+                uint8_t *bp_s = bp_l + Q3_SPLITLUT_BLK_LO1_BYTES;
+                memcpy(bp_s + (size_t)lr * 2u, &sc16, 2);
+
+                for (int g = 0; g < 64; ++g)
+                {
+                    uint8_t nib = (uint8_t)((q3[g * 2 + 0] >> 1) | ((q3[g * 2 + 1] >> 1) << 2));
+                    bp_h[(size_t)g * 32u + (size_t)bo] |= (uint8_t)(nib << sh);
+                }
+                for (int g = 0; g < 32; ++g)
+                {
+                    uint8_t nib = (uint8_t)((q3[g * 4 + 0] & 1) |
+                                            ((q3[g * 4 + 1] & 1) << 1) |
+                                            ((q3[g * 4 + 2] & 1) << 2) |
+                                            ((q3[g * 4 + 3] & 1) << 3));
+                    bp_l[(size_t)g * 32u + (size_t)bo] |= (uint8_t)(nib << sh);
+                }
+            }
+        }
+    }
+    return 0;
 }

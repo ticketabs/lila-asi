@@ -1,5 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "lila_lm_head_candidate.h"
+#include "asi_platform.h"
+#include "asi_v2.h"
 
 #include <ctype.h>
 #include <float.h>
@@ -8,7 +10,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -56,6 +57,7 @@ struct LilaLhcIndex {
     size_t exact_q6k_bytes;
     uint32_t quant_type;
     int is_repacked;
+    int owns_buffers;
     size_t row_bytes;
     double build_ms;
     size_t extra_rss_bytes;
@@ -80,9 +82,7 @@ struct LilaLhcWorkspace {
 };
 
 static double lhc_now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec * 1e-6;
+    return (double)asi_monotonic_ns() * 1e-6;
 }
 
 static size_t lhc_current_rss_bytes(void) {
@@ -323,6 +323,7 @@ LilaLhcIndex *lila_lhc_build_quant_pool(LilaLhcMode mode,
     idx->hidden_size = hidden_size;
     idx->quant_type = quant_type;
     idx->is_repacked = is_repacked ? 1 : 0;
+    idx->owns_buffers = 1;
     idx->row_bytes = row_bytes;
 
     if (mode == LILA_LHC_MODE_1BIT_512) {
@@ -429,9 +430,139 @@ int lila_lhc_is_repacked(const LilaLhcIndex *index) {
 
 void lila_lhc_free(LilaLhcIndex *index) {
     if (!index) return;
-    lhc_aligned_free(index->sketch_data);
-    lhc_aligned_free(index->row_scales);
+    if (index->owns_buffers) {
+        lhc_aligned_free(index->sketch_data);
+        lhc_aligned_free(index->row_scales);
+    }
     free(index);
+}
+
+LilaLhcIndex *lila_lhc_from_serialized(LilaLhcMode expected_mode,
+                                       const uint8_t *sec_data,
+                                       size_t sec_size,
+                                       uint32_t quant_type,
+                                       int is_repacked,
+                                       uint32_t vocab_size,
+                                       uint32_t hidden_size) {
+    if (!sec_data || sec_size < sizeof(AsiSieveSketchHeader)) return NULL;
+    if (((uintptr_t)sec_data & 63u) != 0u) return NULL;
+    if (vocab_size == 0u || hidden_size != 1024u) return NULL;
+    if (!lila_quant_is_supported(quant_type)) return NULL;
+
+    AsiSieveSketchHeader hdr;
+    memcpy(&hdr, sec_data, sizeof(hdr));
+    if (memcmp(hdr.magic, ASI_SIEVE_MAGIC, 8) != 0) return NULL;
+
+    LilaLhcMode mode = (LilaLhcMode)hdr.mode;
+    if (expected_mode != LILA_LHC_MODE_OFF && mode != expected_mode) return NULL;
+    if (mode != LILA_LHC_MODE_1BIT_512 &&
+        mode != LILA_LHC_MODE_1BIT_1024 &&
+        mode != LILA_LHC_MODE_2BIT_1024) {
+        return NULL;
+    }
+    if (hdr.vocab_size != vocab_size || hdr.hidden_size != hidden_size) return NULL;
+    if (hdr.quant_type != quant_type || hdr.is_repacked != (uint32_t)(is_repacked ? 1 : 0)) return NULL;
+
+    size_t row_bytes = lila_quant_row_bytes(quant_type, (int)hidden_size, is_repacked ? 1 : 0);
+    if (row_bytes == 0u) return NULL;
+
+    double t0 = lhc_now_ms();
+    LilaLhcIndex *idx = (LilaLhcIndex *)calloc(1, sizeof(LilaLhcIndex));
+    if (!idx) return NULL;
+
+    idx->mode = mode;
+    idx->vocab_size = vocab_size;
+    idx->hidden_size = hidden_size;
+    idx->quant_type = quant_type;
+    idx->is_repacked = is_repacked ? 1 : 0;
+    idx->owns_buffers = 0;
+    idx->row_bytes = row_bytes;
+
+    if (mode == LILA_LHC_MODE_1BIT_512) {
+        idx->tile_rows = LHC_TILE_ROWS;
+        idx->n_groups = 128u;
+        idx->n_blocks = 8u;
+        idx->groups_per_blk = 16u;
+        idx->sketch_bytes_per_row = 66u;
+        idx->tile_bytes = (size_t)idx->n_groups * 32u;
+    } else if (mode == LILA_LHC_MODE_1BIT_1024) {
+        idx->tile_rows = LHC_TILE_ROWS;
+        idx->n_groups = 256u;
+        idx->n_blocks = 16u;
+        idx->groups_per_blk = 16u;
+        idx->sketch_bytes_per_row = 130u;
+        idx->tile_bytes = (size_t)idx->n_groups * 32u;
+    } else {
+        idx->tile_rows = 8u;
+        idx->n_groups = 0u;
+        idx->n_blocks = 8u;
+        idx->groups_per_blk = 0u;
+        idx->sketch_bytes_per_row = 258u;
+        idx->tile_bytes = 8u * 256u;
+    }
+
+    idx->n_tiles = (vocab_size + idx->tile_rows - 1u) / idx->tile_rows;
+    idx->total_sketch_bytes = (size_t)vocab_size * idx->sketch_bytes_per_row;
+    idx->exact_q6k_bytes = (size_t)vocab_size * row_bytes;
+
+    size_t data_bytes = (size_t)idx->n_tiles * idx->tile_bytes;
+    size_t scale_bytes = (size_t)idx->n_tiles * idx->tile_rows * sizeof(uint16_t);
+
+    if (hdr.n_tiles != idx->n_tiles ||
+        hdr.sketch_bytes != (uint64_t)data_bytes ||
+        hdr.scales_bytes != (uint64_t)scale_bytes ||
+        (hdr.sketch_offset & 63u) != 0u ||
+        (hdr.scales_offset & 63u) != 0u ||
+        hdr.sketch_offset < sizeof(AsiSieveSketchHeader) ||
+        hdr.sketch_offset > (uint64_t)sec_size ||
+        hdr.sketch_bytes > (uint64_t)sec_size - hdr.sketch_offset ||
+        hdr.scales_offset > (uint64_t)sec_size ||
+        hdr.scales_bytes > (uint64_t)sec_size - hdr.scales_offset) {
+        free(idx);
+        return NULL;
+    }
+
+    idx->sketch_data = (uint8_t *)(uintptr_t)(sec_data + hdr.sketch_offset);
+    idx->row_scales = (uint16_t *)(uintptr_t)(sec_data + hdr.scales_offset);
+    idx->build_ms = lhc_now_ms() - t0;
+    idx->extra_rss_bytes = 0u;
+    return idx;
+}
+
+int lila_lhc_serialize_section(const LilaLhcIndex *index,
+                                 uint8_t *out_buf,
+                                 size_t out_cap,
+                                 size_t *out_written) {
+    if (!index || !index->sketch_data || !index->row_scales || !out_written) return -1;
+    size_t data_bytes = (size_t)index->n_tiles * index->tile_bytes;
+    size_t scale_bytes = (size_t)index->n_tiles * index->tile_rows * sizeof(uint16_t);
+    size_t sketch_off = 64u;
+    size_t sketch_aligned = (data_bytes + 63u) & ~(size_t)63u;
+    size_t scales_off = sketch_off + sketch_aligned;
+    size_t scales_aligned = (scale_bytes + 63u) & ~(size_t)63u;
+    size_t total = scales_off + scales_aligned;
+    *out_written = total;
+    if (!out_buf) return 0;
+    if (out_cap < total) return -1;
+
+    memset(out_buf, 0, total);
+    AsiSieveSketchHeader hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    memcpy(hdr.magic, ASI_SIEVE_MAGIC, 8);
+    hdr.mode = (uint32_t)index->mode;
+    hdr.vocab_size = index->vocab_size;
+    hdr.hidden_size = index->hidden_size;
+    hdr.n_tiles = index->n_tiles;
+    hdr.quant_type = index->quant_type;
+    hdr.is_repacked = (uint32_t)index->is_repacked;
+    hdr.sketch_offset = (uint64_t)sketch_off;
+    hdr.sketch_bytes = (uint64_t)data_bytes;
+    hdr.scales_offset = (uint64_t)scales_off;
+    hdr.scales_bytes = (uint64_t)scale_bytes;
+    memcpy(out_buf, &hdr, sizeof(hdr));
+    memcpy(out_buf + sketch_off, index->sketch_data, data_bytes);
+    memcpy(out_buf + scales_off, index->row_scales, scale_bytes);
+    return 0;
 }
 
 int lila_lhc_get_info(const LilaLhcIndex *index, LilaLhcInfo *out_info) {

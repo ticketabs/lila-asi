@@ -1,11 +1,14 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "asi_v2.h"
+#include "asi_ed25519.h"
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
-#include <windows.h>
-#else
+#ifndef _WIN32
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -19,7 +22,7 @@ static void set_err(char *buf, size_t cap, const char *msg)
     snprintf(buf, cap, "%s", msg ? msg : "unknown error");
 }
 
-static uint64_t g_crc64_table[256];
+static uint64_t g_crc64_tables[8][256];
 static int g_crc64_table_init = 0;
 
 static void init_crc64_table(void)
@@ -34,7 +37,15 @@ static void init_crc64_table(void)
             else
                 crc <<= 1;
         }
-        g_crc64_table[i] = crc;
+        g_crc64_tables[0][i] = crc;
+    }
+    for (int t = 1; t < 8; t++)
+    {
+        for (uint64_t i = 0; i < 256; i++)
+        {
+            uint64_t prev = g_crc64_tables[t - 1][i];
+            g_crc64_tables[t][i] = (prev << 8) ^ g_crc64_tables[0][prev >> 56];
+        }
     }
     g_crc64_table_init = 1;
 }
@@ -44,9 +55,22 @@ uint64_t asi_v2_crc64(const uint8_t *data, size_t len)
     if (!g_crc64_table_init)
         init_crc64_table();
     uint64_t crc = 0;
-    for (size_t i = 0; i < len; i++)
+    size_t i = 0;
+    while (i + 8u <= len)
     {
-        crc = (crc << 8) ^ g_crc64_table[((crc >> 56) ^ data[i]) & 0xFF];
+        crc = g_crc64_tables[7][((crc >> 56) ^ data[i + 0u]) & 0xFFu] ^
+              g_crc64_tables[6][((crc >> 48) ^ data[i + 1u]) & 0xFFu] ^
+              g_crc64_tables[5][((crc >> 40) ^ data[i + 2u]) & 0xFFu] ^
+              g_crc64_tables[4][((crc >> 32) ^ data[i + 3u]) & 0xFFu] ^
+              g_crc64_tables[3][((crc >> 24) ^ data[i + 4u]) & 0xFFu] ^
+              g_crc64_tables[2][((crc >> 16) ^ data[i + 5u]) & 0xFFu] ^
+              g_crc64_tables[1][((crc >>  8) ^ data[i + 6u]) & 0xFFu] ^
+              g_crc64_tables[0][(crc          ^ data[i + 7u]) & 0xFFu];
+        i += 8u;
+    }
+    for (; i < len; i++)
+    {
+        crc = (crc << 8) ^ g_crc64_tables[0][((crc >> 56) ^ data[i]) & 0xFFu];
     }
     return crc;
 }
@@ -151,7 +175,8 @@ int asi_v2_validate_memory(const uint8_t *data, size_t size, AsiV2Cartridge *out
             set_err(err_buf, err_cap, "section offset is not page-aligned");
             return -1;
         }
-        int is_bulk_blob = (s->type == ASI_SEC_WEIGHTS || s->type == ASI_SEC_VISION || s->type == ASI_SEC_AUDIO);
+        int is_bulk_blob = (s->type == ASI_SEC_WEIGHTS || s->type == ASI_SEC_VISION ||
+                            s->type == ASI_SEC_AUDIO || s->type == ASI_SEC_SIEVE_SKETCH);
         const char *verify_env = getenv("LILA_ASI_VERIFY_CRC");
         if (!is_bulk_blob || (verify_env && verify_env[0] == '1'))
         {
@@ -214,6 +239,37 @@ int asi_v2_validate_memory(const uint8_t *data, size_t size, AsiV2Cartridge *out
         return -1;
     }
 
+    const char *req_sig = getenv("LILA_ASI_REQUIRE_SIGNATURE");
+    if (req_sig && req_sig[0] == '1')
+    {
+        uint8_t pk_buf[32];
+        const uint8_t *trusted_pk = NULL;
+        const char *pk_hex = getenv("LILA_ASI_TRUSTED_PUBKEY");
+        if (pk_hex && pk_hex[0] != '\0')
+        {
+            if (strlen(pk_hex) != 64)
+            {
+                set_err(err_buf, err_cap, "LILA_ASI_TRUSTED_PUBKEY must be 64 hex chars");
+                return -1;
+            }
+            for (size_t i = 0; i < 32; i++)
+            {
+                unsigned int v = 0;
+                if (!isxdigit((unsigned char)pk_hex[i * 2]) ||
+                    !isxdigit((unsigned char)pk_hex[i * 2 + 1]) ||
+                    sscanf(pk_hex + i * 2, "%2x", &v) != 1)
+                {
+                    set_err(err_buf, err_cap, "invalid hex in LILA_ASI_TRUSTED_PUBKEY");
+                    return -1;
+                }
+                pk_buf[i] = (uint8_t)v;
+            }
+            trusted_pk = pk_buf;
+        }
+        if (asi_v2_verify_signature(out, trusted_pk, NULL, err_buf, err_cap) != 0)
+            return -1;
+    }
+
     return 0;
 }
 
@@ -268,6 +324,13 @@ int asi_v2_open(const char *path, AsiV2Cartridge *out, char *err_buf, size_t err
         set_err(err_buf, err_cap, "mmap failed");
         return -1;
     }
+#ifdef MADV_HUGEPAGE
+    {
+        const char *no_thp = getenv("LILA_ASI_NO_HUGEPAGE");
+        if (!no_thp || no_thp[0] != '1')
+            madvise(m, file_size, MADV_HUGEPAGE);
+    }
+#endif
     mapped = (const uint8_t *)m;
 #endif
 
@@ -363,4 +426,158 @@ void asi_v2_repack_q6k(const uint8_t *src, uint8_t *dst, size_t n_blocks)
         memcpy(out + 272, &d, 4);
         memset(out + 276, 0, 12);
     }
+}
+
+static void sha256_update_u32le(AsiSha256Ctx *ctx, uint32_t v)
+{
+    uint8_t b[4] = {
+        (uint8_t)(v & 0xFFu),
+        (uint8_t)((v >> 8) & 0xFFu),
+        (uint8_t)((v >> 16) & 0xFFu),
+        (uint8_t)((v >> 24) & 0xFFu),
+    };
+    asi_sha256_update(ctx, b, 4);
+}
+
+static void sha256_update_u64le(AsiSha256Ctx *ctx, uint64_t v)
+{
+    uint8_t b[8];
+    for (int i = 0; i < 8; i++) b[i] = (uint8_t)((v >> (i * 8)) & 0xFFu);
+    asi_sha256_update(ctx, b, 8);
+}
+
+int asi_v2_compute_signing_digest(const AsiV2Cartridge *cart,
+                                  const AsiV2SignatureBlock *sig_blk,
+                                  uint8_t out_digest[32])
+{
+    if (!cart || !cart->base || !cart->sections || !sig_blk || !out_digest)
+        return -1;
+
+    static const uint8_t kDomain[19] = "LILA-ASI-V2-SIG-V1";
+    AsiSha256Ctx manifest;
+    asi_sha256_init(&manifest);
+    asi_sha256_update(&manifest, kDomain, sizeof(kDomain));
+
+    uint32_t signed_count = 0;
+    for (uint32_t i = 0; i < cart->header.n_sections; i++)
+    {
+        if (cart->sections[i].type != ASI_SEC_SIGNATURE)
+            signed_count++;
+    }
+
+    sha256_update_u32le(&manifest, cart->header.magic);
+    sha256_update_u32le(&manifest, cart->header.version);
+    sha256_update_u32le(&manifest, cart->header.arch_id);
+    sha256_update_u32le(&manifest, cart->header.flags & ~ASI_V2_FLAG_HAS_SIGNATURE);
+    sha256_update_u32le(&manifest, signed_count);
+
+    for (uint32_t i = 0; i < cart->header.n_sections; i++)
+    {
+        const AsiV2SectionEntry *s = &cart->sections[i];
+        if (s->type == ASI_SEC_SIGNATURE)
+            continue;
+        if (s->offset > cart->file_size || s->size > cart->file_size - s->offset)
+            return -1;
+
+        AsiSha256Ctx sec_hash_ctx;
+        uint8_t sec_hash[32];
+        asi_sha256_init(&sec_hash_ctx);
+        asi_sha256_update(&sec_hash_ctx, cart->base + s->offset, (size_t)s->size);
+        asi_sha256_final(&sec_hash_ctx, sec_hash);
+
+        sha256_update_u32le(&manifest, s->type);
+        sha256_update_u32le(&manifest, s->flags);
+        sha256_update_u64le(&manifest, s->size);
+        sha256_update_u64le(&manifest, s->checksum);
+        asi_sha256_update(&manifest, sec_hash, 32);
+    }
+
+    sha256_update_u32le(&manifest, sig_blk->version);
+    sha256_update_u32le(&manifest, sig_blk->alg_id);
+    sha256_update_u64le(&manifest, sig_blk->signed_at_unix);
+    asi_sha256_update(&manifest, (const uint8_t *)sig_blk->publisher, sizeof(sig_blk->publisher));
+    asi_sha256_update(&manifest, sig_blk->public_key, sizeof(sig_blk->public_key));
+    asi_sha256_final(&manifest, out_digest);
+    return 0;
+}
+
+int asi_v2_verify_signature(const AsiV2Cartridge *cart,
+                            const uint8_t *trusted_pubkey_32,
+                            AsiV2SignatureInfo *out_info,
+                            char *err_buf,
+                            size_t err_cap)
+{
+    if (out_info) memset(out_info, 0, sizeof(*out_info));
+    if (!cart || !cart->base)
+    {
+        set_err(err_buf, err_cap, "null cartridge");
+        return -1;
+    }
+
+    const AsiV2SectionEntry *sig_sec = asi_v2_find_section(cart, ASI_SEC_SIGNATURE);
+    if (!sig_sec)
+    {
+        set_err(err_buf, err_cap, "cartridge has no SIGNATURE section");
+        return -1;
+    }
+    if (sig_sec->size < sizeof(AsiV2SignatureBlock))
+    {
+        set_err(err_buf, err_cap, "SIGNATURE section is truncated");
+        return -1;
+    }
+
+    AsiV2SignatureBlock blk;
+    memcpy(&blk, cart->base + sig_sec->offset, sizeof(blk));
+    if (memcmp(blk.magic, "ASISIG1\0", 8) != 0)
+    {
+        set_err(err_buf, err_cap, "invalid SIGNATURE block magic");
+        return -1;
+    }
+    if (blk.version != ASI_SIG_VERSION || blk.alg_id != ASI_SIG_ALG_ED25519)
+    {
+        set_err(err_buf, err_cap, "unsupported SIGNATURE version or algorithm");
+        return -1;
+    }
+
+    if (trusted_pubkey_32 != NULL && !asi_ct_memeq(blk.public_key, trusted_pubkey_32, 32))
+    {
+        set_err(err_buf, err_cap, "signer public key does not match trusted publisher key");
+        return -1;
+    }
+
+    /* Re-verify section CRCs first so tampered bulk blobs are caught deterministically */
+    for (uint32_t i = 0; i < cart->header.n_sections; i++)
+    {
+        const AsiV2SectionEntry *s = &cart->sections[i];
+        uint64_t actual_crc = asi_v2_crc64(cart->base + s->offset, (size_t)s->size);
+        if (actual_crc != s->checksum)
+        {
+            set_err(err_buf, err_cap, "section CRC-64 checksum mismatch during signature verify");
+            return -1;
+        }
+    }
+
+    uint8_t digest[32];
+    if (asi_v2_compute_signing_digest(cart, &blk, digest) != 0)
+    {
+        set_err(err_buf, err_cap, "failed to compute canonical signing digest");
+        return -1;
+    }
+
+    if (asi_ed25519_verify(blk.signature, digest, sizeof(digest), blk.public_key) != 0)
+    {
+        set_err(err_buf, err_cap, "Ed25519 signature verification failed (tampered cartridge)");
+        return -1;
+    }
+
+    if (out_info)
+    {
+        out_info->valid = 1;
+        out_info->alg_id = blk.alg_id;
+        out_info->signed_at_unix = blk.signed_at_unix;
+        memcpy(out_info->publisher, blk.publisher, sizeof(blk.publisher));
+        out_info->publisher[sizeof(blk.publisher)] = '\0';
+        memcpy(out_info->public_key, blk.public_key, sizeof(blk.public_key));
+    }
+    return 0;
 }

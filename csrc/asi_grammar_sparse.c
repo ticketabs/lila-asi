@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include "asi_grammar_sparse.h"
+#include "asi_platform.h"
 #include "q4k.h"
 
 #include <ctype.h>
@@ -10,16 +11,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
 
 static inline double gs_now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec * 1e-6;
+    return (double)asi_monotonic_ns() * 1e-6;
 }
 
 /* ============================================================================
@@ -194,7 +192,7 @@ static const char *find_json_key(const char *buf, size_t size, const char *key) 
     const char *end = buf + size;
     const char *p = buf;
     while (p < end) {
-        const char *hit = (const char *)memmem(p, (size_t)(end - p), pat, (size_t)n);
+        const char *hit = (const char *)asi_memmem(p, (size_t)(end - p), pat, (size_t)n);
         if (!hit) return NULL;
         const char *q = hit + n;
         while (q < end && (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n')) ++q;

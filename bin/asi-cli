@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-asi-cli — Unified Command-Line Interface for Lila ASI v2.4 Cartridges (.asi)
+asi-cli — Unified Command-Line Interface for Lila ASI v2.6 Cartridges (.asi / .asiv)
 
 Subcommands:
-  asi-cli pack  <input.gguf> -o <output.asi> [--mmproj <mmproj.gguf>]
-  asi-cli info  <model.asi>
-  asi-cli run   <model.asi> -p "Prompt" [-n 256] [-t 2] [--temp 0.6] [--mode fast|balanced|exact]
+  asi-cli pack  <input.gguf> [-o <output.asi|.asiv>] [--mmproj <mmproj.gguf>]
+  asi-cli info  <model.asi|mmproj.asiv>
+  asi-cli run   <model.asi> -p "Prompt" [--asiv mmproj.asiv --image img.png] [-n 256] [-t 2]
   asi-cli chat  <model.asi> [-t 2] [--ctx 8192] [--mode fast|balanced|exact]
   asi-cli bench <model.asi> [-n 64] [-t 2] [--mode fast|balanced|exact]
 """
@@ -41,20 +41,51 @@ def _load_sdk():
         return AsiRuntime, apply_asi_mode_preset, convert_gguf_to_asi_v2
 
 
+def _load_vision_session_cls():
+    try:
+        from lila_asi import AsiVisionSession
+        if AsiVisionSession is not None:
+            return AsiVisionSession
+    except ImportError:
+        pass
+    from asi_vision_sdk import AsiVisionSession
+    return AsiVisionSession
+
+
 def cmd_pack(args: argparse.Namespace) -> int:
     _, _, convert_gguf_to_asi_v2 = _load_sdk()
     gguf_path = Path(args.gguf).expanduser().resolve()
-    out_path = Path(args.output).expanduser().resolve()
+    out_path = Path(args.output).expanduser().resolve() if args.output else None
     mmproj = Path(args.mmproj).expanduser().resolve() if args.mmproj else None
     t0 = time.perf_counter()
     out = convert_gguf_to_asi_v2(gguf_path, out_path, mmproj_path=mmproj)
     dt = time.perf_counter() - t0
     sz_mib = out.stat().st_size / (1024.0 * 1024.0)
     print(f"[asi-cli] Packed {gguf_path.name} -> {out} ({sz_mib:.2f} MiB in {dt:.2f}s)")
+    if mmproj is not None and out.suffix.lower() != ".asiv":
+        asiv_out = out.with_suffix(".asiv")
+        if asiv_out.is_file():
+            print(f"[asi-cli] Packed vision sidecar -> {asiv_out} ({asiv_out.stat().st_size / (1024.0 * 1024.0):.2f} MiB)")
     return 0
 
 
 def cmd_info(args: argparse.Namespace) -> int:
+    model_path = Path(args.model).expanduser().resolve()
+    if model_path.suffix.lower() == ".asiv":
+        AsiVisionSession = _load_vision_session_cls()
+        vs = AsiVisionSession(model_path)
+        try:
+            vh = vs.header
+            print(f"ASIV Sidecar   : {model_path}")
+            print(f"Adapter ID     : {int(vh.adapter_id)}")
+            print(f"Layers         : {int(vh.n_layers)} (hidden={int(vh.hidden_size)}, intermediate={int(vh.intermediate_size)})")
+            print(f"Projection Dim : {int(vh.projection_dim)} (expected_llm_arch={int(vh.expected_llm_arch_id)})")
+            print(f"Patch / Merge  : patch={int(vh.patch_size)}, merge={int(vh.spatial_merge_size)}")
+            print(f"Universal Graph: {bool(vs.has_graph())}")
+            print(f"Pairing Bridge : {bool(vs.has_pairing())}")
+        finally:
+            vs.close()
+        return 0
     native_cli = HERE / "lila-asi-cli"
     if not native_cli.is_file():
         native_cli = HERE.parents[1] / "engine" / "lila-asi-cli"
@@ -80,10 +111,25 @@ def cmd_run(args: argparse.Namespace) -> int:
     apply_asi_mode_preset(args.mode)
     rt = AsiRuntime(str(args.model), n_ctx=args.ctx, n_threads=args.threads)
     try:
+        asiv_path = getattr(args, "asiv", None)
+        if asiv_path:
+            rt.attach_vision(Path(asiv_path).expanduser().resolve())
+        elif getattr(args, "image", None):
+            stem_asiv = Path(args.model).expanduser().resolve().with_suffix(".asiv")
+            if stem_asiv.is_file():
+                rt.attach_vision(stem_asiv)
         messages = []
         if args.system:
             messages.append({"role": "system", "content": args.system})
-        messages.append({"role": "user", "content": args.prompt})
+        if getattr(args, "image", None):
+            content = [
+                {"type": "image_url", "image_url": {"url": str(Path(p).expanduser().resolve())}}
+                for p in args.image
+            ]
+            content.append({"type": "text", "text": args.prompt})
+            messages.append({"role": "user", "content": content})
+        else:
+            messages.append({"role": "user", "content": args.prompt})
         t0 = time.perf_counter()
         n_chunks = 0
         for ev in rt.create_chat_completion(
@@ -162,23 +208,25 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(prog="asi-cli", description="Lila ASI v2.4 Standalone CLI")
+    ap = argparse.ArgumentParser(prog="asi-cli", description="Lila ASI v2.6 Standalone CLI")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p_pack = sub.add_parser("pack", help="Convert a .gguf model into an .asi v2 cartridge")
+    p_pack = sub.add_parser("pack", help="Convert any .gguf model or vision mmproj into an .asi / .asiv cartridge")
     p_pack.add_argument("gguf", help="Input .gguf path")
-    p_pack.add_argument("-o", "--output", required=True, help="Output .asi path")
+    p_pack.add_argument("-o", "--output", default=None, help="Output .asi or .asiv path (auto-detected if omitted)")
     p_pack.add_argument("--mmproj", default=None, help="Optional vision projector .gguf")
     p_pack.set_defaults(func=cmd_pack)
 
-    p_info = sub.add_parser("info", help="Inspect an .asi cartridge header, sections, and architecture")
-    p_info.add_argument("model", help="Path to .asi cartridge")
+    p_info = sub.add_parser("info", help="Inspect an .asi or .asiv cartridge header, sections, and architecture")
+    p_info.add_argument("model", help="Path to .asi or .asiv cartridge")
     p_info.set_defaults(func=cmd_info)
 
-    p_run = sub.add_parser("run", help="Run single-turn streaming generation on an .asi cartridge")
+    p_run = sub.add_parser("run", help="Run single-turn streaming generation (optional multimodal --asiv + --image)")
     p_run.add_argument("model", help="Path to .asi cartridge")
     p_run.add_argument("-p", "--prompt", required=True, help="User prompt")
     p_run.add_argument("-s", "--system", default="You are a helpful assistant.", help="System prompt")
+    p_run.add_argument("--asiv", default=None, help="Optional .asiv vision sidecar path")
+    p_run.add_argument("--image", action="append", default=None, help="Optional image file path (repeatable)")
     p_run.add_argument("-n", "--max-tokens", type=int, default=256, help="Max tokens to generate")
     p_run.add_argument("-t", "--threads", type=int, default=2, help="CPU threads")
     p_run.add_argument("--ctx", type=int, default=4096, help="Context window tokens")

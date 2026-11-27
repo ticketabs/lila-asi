@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import struct
+import sys
 import threading
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
@@ -49,11 +50,14 @@ _SEC_TOKENIZER = 0x04
 _SEC_CHAT_TEMPLATE = 0x09
 _DEFAULT_PREFIX_CACHE_MAX_FILES = 8
 
-ASI_ENGINE_VERSION = "ASI v2.4"
-# Working name attached specifically to the two-stage full-vocabulary lm_head
-# screening feature (not an engine-wide claim until broader multi-machine
-# validation holds up).
+ASI_ENGINE_VERSION = "ASI v2.6"
+# Feature-scoped working names (per naming policy):
+# - Sieve: two-stage full-vocabulary lm_head screening (E03)
+# - Anchor: CoW state tree, crash-proof WAL, live confidence & provenance (E06)
+# - Torrent: Q4_REPACK, BLIS prefill, ChunkWY-32, sparse ffn_down, B<=2 spec (E07)
 ASI_SIEVE_WORKING_NAME = "Sieve"
+ASI_ANCHOR_WORKING_NAME = "Anchor"
+ASI_TORRENT_WORKING_NAME = "Torrent"
 ASI_ACTIVE_CODENAME: Optional[str] = None
 
 # Plain-English engine presets for non-technical users (LILA_ASI_MODE=fast|balanced|exact).
@@ -220,11 +224,25 @@ ASI_VERSION_CATALOG: Dict[str, Dict[str, Optional[object]]] = {
         "location": "engine/asi/liblila_asi.so (asi_grammar_sparse.c + e05_bridge.c)",
         "summary": "Model-triggered C11 DFA <tool_call> format guardrails + Grammar-Aware Sparse lm_head + forced-token fast-forward (v2: 512 tools, optional args, RFC-8259 UTF-8 strings).",
     },
-    "Exp E06 (state_centric_c)": {
+    "Exp E06 (Anchor)": {
         "codename": None,
+        "feature_working_name": ASI_ANCHOR_WORKING_NAME,
         "status": "active_promoted_source",
         "location": "engine/asi/liblila_asi.so (asi_state_centric.c)",
-        "summary": "C Forkable CoW State Tree (ASITREE1) + per-branch provenance + WAL SIGKILL recovery + Confidence API.",
+        "summary": "Anchor (E06): C Forkable CoW State Tree (ASITREE1) + per-branch provenance + WAL SIGKILL recovery + Confidence API.",
+    },
+    "ASI v2.5 (Native Vision & Universal Graph)": {
+        "codename": None,
+        "status": "active_promoted_source",
+        "location": "engine/asi/liblila_asi.so (asi_vision.c, asi_kernels.c, asi_graph.c, asi_pairing.c, asi_vision_sdk.py)",
+        "summary": "V1-V9 Two-Tier Universal Vision Runtime + 3D M-RoPE multimodal decoder + Immutable V8 Pairing + V9 SDK & Active Inspection.",
+    },
+    "ASI v2.6 (Torrent)": {
+        "codename": None,
+        "feature_working_name": ASI_TORRENT_WORKING_NAME,
+        "status": "active_promoted_source",
+        "location": "engine/asi/liblila_asi.so (q4k.h, asi_arch.c, asi_v2.c, asi_requant.py)",
+        "summary": "Torrent (E07): Q4_REPACK (4.25 bpw) + sparse col-major ffn_down + ChunkWY-32 DeltaNet prefill + BLIS 6x16 (>=96 tok) + B<=2 spec cap + MADV_HUGEPAGE + slice-by-8 CRC-64.",
     },
 }
 
@@ -242,6 +260,40 @@ def active_asi_label() -> str:
 
 
 active_asi_codename = active_asi_label
+
+
+class _AsiBranchProvenance(ctypes.Structure):
+    _fields_ = [
+        ("branch_id", ctypes.c_uint32),
+        ("parent_branch_id", ctypes.c_uint32),
+        ("state_version", ctypes.c_uint32),
+        ("n_tokens", ctypes.c_uint32),
+        ("status", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+        ("token_trajectory_sha256", ctypes.c_uint8 * 32),
+    ]
+
+
+class _AsiCheckpointInfo(ctypes.Structure):
+    _fields_ = [
+        ("cp_id", ctypes.c_uint32),
+        ("parent_cp_id", ctypes.c_uint32),
+        ("rng_state", ctypes.c_uint64),
+        ("prov", _AsiBranchProvenance),
+        ("label", ctypes.c_char * 64),
+    ]
+
+
+class _AsiCowStats(ctypes.Structure):
+    _fields_ = [
+        ("live_slots", ctypes.c_uint32),
+        ("max_slots", ctypes.c_uint32),
+        ("physical_kv_pages", ctypes.c_uint32),
+        ("logical_kv_pages", ctypes.c_uint32),
+        ("shared_kv_pages", ctypes.c_uint32),
+        ("cow_reuses", ctypes.c_uint64),
+        ("cow_allocs", ctypes.c_uint64),
+    ]
 
 
 class _AsiV2Header(ctypes.Structure):
@@ -534,24 +586,64 @@ class IncrementalBpeUtf8Decoder:
         self._utf8_decoder.reset()
 
 
+def _host_supports_avx2_fma_f16c() -> bool:
+    """Return True when the host CPU supports AVX2 + FMA + F16C for portable library selection."""
+    override = os.environ.get("LILA_ASI_ARCH", "").strip().lower()
+    if override == "scalar":
+        return False
+    if override == "avx2":
+        return True
+    try:
+        if sys.platform.startswith("linux"):
+            info = Path("/proc/cpuinfo").read_text(errors="ignore").lower()
+            flags_line = next((ln for ln in info.splitlines() if ln.startswith("flags")), "")
+            tokens = set(flags_line.split())
+            return {"avx2", "fma", "f16c"}.issubset(tokens)
+        if sys.platform.startswith("win"):
+            # Windows IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE == 40)
+            return bool(ctypes.windll.kernel32.IsProcessorFeaturePresent(40))
+    except Exception:
+        pass
+    return False
+
+
 def _default_lib_path() -> Path:
     env_path = os.environ.get("LILA_ASI_LIB")
     if env_path:
         return Path(env_path)
     here = Path(__file__).resolve().parent
-    for candidate in (
-        here / "liblila_asi.so",
-        here.parent / "lib" / "liblila_asi.so",
-        here.parents[1] / "engine" / "asi" / "liblila_asi.so",
-    ):
-        if candidate.exists():
-            return candidate
-    return here.parents[1] / "engine" / "asi" / "liblila_asi.so"
+    has_avx2 = _host_supports_avx2_fma_f16c()
+    if sys.platform.startswith("win"):
+        names = (
+            ("lila_asi_avx2.dll", "lila_asi.dll", "lila_asi_scalar.dll")
+            if has_avx2
+            else ("lila_asi_scalar.dll", "lila_asi.dll")
+        )
+    elif sys.platform == "darwin":
+        names = ("liblila_asi.dylib",)
+    else:
+        names = (
+            ("liblila_asi.so", "liblila_asi_portable_avx2.so", "liblila_asi_portable_scalar.so")
+            if has_avx2
+            else ("liblila_asi_portable_scalar.so", "liblila_asi.so")
+        )
+
+    search_dirs = (
+        here,
+        here.parent / "lib",
+        here.parents[1] / "engine" / "asi",
+    )
+    for directory in search_dirs:
+        for name in names:
+            candidate = directory / name
+            if candidate.exists():
+                return candidate
+    return here.parents[1] / "engine" / "asi" / names[0]
 
 
 class AsiRuntime:
     """
-    Standalone Python runtime for liblila_asi.so + .asi cartridges (zero llama.cpp dependency).
+    Standalone Python runtime for liblila_asi.so / lila_asi.dll + .asi cartridges (zero llama.cpp dependency).
     """
 
     def __init__(
@@ -565,7 +657,7 @@ class AsiRuntime:
     ):
         so = Path(lib_path) if lib_path else _default_lib_path()
         if not so.exists():
-            raise FileNotFoundError(f"liblila_asi.so not found at {so}")
+            raise FileNotFoundError(f"ASI runtime shared library not found at {so}")
 
         self._lib = ctypes.CDLL(str(so))
         self._has_model_header = False
@@ -619,9 +711,13 @@ class AsiRuntime:
 
         self._logits = (ctypes.c_float * self._cfg.vocab_size)()
         self._rng = ctypes.c_uint64(0x9E3779B97F4A7C15)
+        self._n_threads = max(1, int(n_threads or 2))
         self._cached_prefix_ids: Optional[List[int]] = None
         self._cached_prefix_text: Optional[str] = None
         self._session_token_ids: List[int] = []
+        self._vision_session: Optional[Any] = None
+        self._vision_controller: Optional[Any] = None
+        self._vision_asiv_path: Optional[str] = None
         self.engine_version = ASI_ENGINE_VERSION
         self.runtime_label = active_asi_label()
         self.codename = ASI_ACTIVE_CODENAME
@@ -729,6 +825,74 @@ class AsiRuntime:
             lib.e05_hook_configure.restype = None
             lib.e05_hook_set_skip_lm_head.argtypes = [ctypes.c_int]
             lib.e05_hook_set_skip_lm_head.restype = None
+
+        self._supports_multimodal = bool(
+            hasattr(lib, "lila_asi_eval_embd")
+            and hasattr(lib, "lila_asi_build_mrope_grid")
+            and hasattr(lib, "lila_asi_session_get_rope_delta")
+        )
+        if self._supports_multimodal:
+            lib.lila_asi_eval_embd.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_float),
+            ]
+            lib.lila_asi_eval_embd.restype = ctypes.c_int
+            lib.lila_asi_build_mrope_grid.argtypes = [
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_size_t,
+            ]
+            lib.lila_asi_build_mrope_grid.restype = ctypes.c_uint32
+            lib.lila_asi_session_get_rope_delta.argtypes = [ctypes.c_void_p]
+            lib.lila_asi_session_get_rope_delta.restype = ctypes.c_int64
+            lib.lila_asi_session_set_rope_delta.argtypes = [ctypes.c_void_p, ctypes.c_int64]
+            lib.lila_asi_session_set_rope_delta.restype = None
+
+        self._supports_anchor = bool(
+            hasattr(lib, "lila_asi_cp_fork")
+            and hasattr(lib, "lila_asi_cp_restore")
+            and hasattr(lib, "lila_asi_cp_get_info")
+            and hasattr(lib, "lila_asi_cp_cow_stats")
+        )
+        if self._supports_anchor:
+            lib.lila_asi_cp_fork.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint64,
+                ctypes.c_char_p,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            lib.lila_asi_cp_fork.restype = ctypes.c_int
+            lib.lila_asi_cp_restore.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.POINTER(ctypes.c_uint64),
+            ]
+            lib.lila_asi_cp_restore.restype = ctypes.c_int
+            lib.lila_asi_cp_get_info.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(_AsiCheckpointInfo),
+            ]
+            lib.lila_asi_cp_get_info.restype = ctypes.c_int
+            lib.lila_asi_cp_cow_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(_AsiCowStats)]
+            lib.lila_asi_cp_cow_stats.restype = ctypes.c_int
+            if hasattr(lib, "lila_asi_cp_commit"):
+                lib.lila_asi_cp_commit.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+                lib.lila_asi_cp_commit.restype = ctypes.c_int
+            if hasattr(lib, "lila_asi_cp_abandon"):
+                lib.lila_asi_cp_abandon.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+                lib.lila_asi_cp_abandon.restype = ctypes.c_int
 
     def _free_e05_locked(self) -> None:
         if getattr(self, "_supports_e05", False) and getattr(self, "_lib", None) is not None:
@@ -924,10 +1088,251 @@ class AsiRuntime:
         self._e05_tool_sig = sig
         return True
 
+    def close_vision(self) -> None:
+        self._vision_controller = None
+        if getattr(self, "_vision_session", None) is not None:
+            try:
+                self._vision_session.close()
+            except Exception:
+                pass
+            self._vision_session = None
+        self._vision_asiv_path = None
+
+    def evict_vision(self) -> int:
+        if getattr(self, "_vision_session", None) is None:
+            return 0
+        return int(self._vision_session.evict())
+
+    @property
+    def vision_enabled(self) -> bool:
+        return getattr(self, "_vision_session", None) is not None
+
+    @property
+    def vision_asiv_path(self) -> Optional[str]:
+        return getattr(self, "_vision_asiv_path", None)
+
+    def attach_vision(self, asiv_path: Union[str, Path], *, exec_mode: int = 0) -> None:
+        """Lazily open `.asiv` sidecar and bind compatibility to this loaded text model."""
+        try:
+            from .asi_vision_sdk import (
+                AdaptiveVisionController,
+                AsiV2ModelConfig as VisionModelCfg,
+                AsiVisionSession,
+            )
+        except ImportError:
+            asi_dir = str(Path(__file__).resolve().parents[2] / "engine" / "asi")
+            if asi_dir not in sys.path:
+                sys.path.insert(0, asi_dir)
+            from asi_vision_sdk import (
+                AdaptiveVisionController,
+                AsiV2ModelConfig as VisionModelCfg,
+                AsiVisionSession,
+            )
+
+        with self._lock:
+            if not self._model:
+                raise RuntimeError("AsiRuntime is closed")
+            self.close_vision()
+            vsess = AsiVisionSession(Path(asiv_path), lib=self._lib, exec_mode=exec_mode)
+            try:
+                vcfg = VisionModelCfg()
+                ctypes.memmove(ctypes.byref(vcfg), ctypes.byref(self._cfg), ctypes.sizeof(VisionModelCfg))
+                vsess.check_compat(vcfg)
+            except Exception:
+                vsess.close()
+                raise
+            self._vision_session = vsess
+            self._vision_controller = AdaptiveVisionController(vsess)
+            self._vision_asiv_path = str(asiv_path)
+
+    def encode_image(
+        self,
+        rgb_u8: object,
+        *,
+        min_pixels: int = 56 * 56,
+        max_pixels: int = 448 * 448,
+        n_threads: int = 2,
+        use_pairing: Optional[bool] = None,
+    ):
+        with self._lock:
+            if self._vision_session is None:
+                raise RuntimeError("No .asiv attached; call attach_vision(asiv_path) first")
+            return self._vision_session.encode_rgb(
+                rgb_u8,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+                n_threads=n_threads,
+                use_pairing=use_pairing,
+            )
+
+    def create_multimodal_completion(
+        self,
+        prompt: str,
+        images: Sequence[object],
+        *,
+        system_prompt: Optional[str] = None,
+        max_tokens: int = 32,
+        temperature: float = 0.0,
+        min_pixels: int = 56 * 56,
+        max_pixels: int = 448 * 448,
+        n_threads: int = 2,
+        adaptive: bool = False,
+        use_pairing: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Encode RGB images lazily via `.asiv` and decode natively with 3D M-RoPE."""
+        import numpy as np
+
+        if not self._supports_multimodal:
+            raise RuntimeError("Loaded liblila_asi.so does not expose multimodal eval_embd ABI")
+        with self._lock:
+            if not self._session or not self._model:
+                raise RuntimeError("AsiRuntime is closed")
+            if self._vision_session is None:
+                raise RuntimeError("No .asiv attached; call attach_vision(asiv_path) first")
+            vis_start = self.tokenizer.vocab.get("<|vision_start|>")
+            vis_end = self.tokenizer.vocab.get("<|vision_end|>")
+            im_end = self.tokenizer.vocab.get("<|im_end|>")
+            eot = self.tokenizer.vocab.get("<|endoftext|>", self.tokenizer.eos_token_id)
+            if vis_start is None or vis_end is None or im_end is None:
+                raise RuntimeError("Model tokenizer lacks Qwen3.5 vision/chat special tokens")
+
+            self._lib.lila_asi_session_reset(self._session)
+            self._session_token_ids = []
+            kv_pos = 0
+            rope_pos = 0
+            ledger_records: List[Dict[str, Any]] = []
+
+            if system_prompt:
+                sys_ids = self._encode_message_tokens("system", system_prompt, close_message=True)
+                if sys_ids:
+                    sys_arr = (ctypes.c_int32 * len(sys_ids))(*sys_ids)
+                    if self._lib.lila_asi_eval_batch(self._session, sys_arr, len(sys_ids), kv_pos, self._logits) != 0:
+                        raise RuntimeError("Failed evaluating multimodal system prompt")
+                    kv_pos += len(sys_ids)
+                    rope_pos += len(sys_ids)
+
+            prefix_ids = self.tokenizer.encode("<|im_start|>user\n", allow_special=("<|im_start|>",))
+            arr = (ctypes.c_int32 * len(prefix_ids))(*prefix_ids)
+            if self._lib.lila_asi_eval_batch(self._session, arr, len(prefix_ids), kv_pos, self._logits) != 0:
+                raise RuntimeError("Failed evaluating multimodal user header")
+            kv_pos += len(prefix_ids)
+            rope_pos += len(prefix_ids)
+
+            for img in images:
+                vs_arr = (ctypes.c_int32 * 1)(vis_start)
+                if self._lib.lila_asi_eval_batch(self._session, vs_arr, 1, kv_pos, self._logits) != 0:
+                    raise RuntimeError("Failed evaluating <|vision_start|>")
+                kv_pos += 1
+                rope_pos += 1
+
+                if adaptive and self._vision_controller is not None:
+                    res = self._vision_controller.inspect(
+                        np.asarray(img, dtype=np.uint8), n_threads=n_threads, use_pairing=use_pairing
+                    )
+                    enc_list = [res["coarse"]] + list(res.get("rois") or ())
+                    for rec in res["ledger"].records:
+                        ledger_records.append(
+                            {
+                                "record_id": rec.record_id,
+                                "region_id": rec.region_id,
+                                "original_box_xyxy": rec.original_box_xyxy,
+                                "status": rec.status.value,
+                                "n_tokens": rec.n_tokens,
+                                "cached": rec.cached,
+                            }
+                        )
+                else:
+                    enc_list = [
+                        self._vision_session.encode_rgb(
+                            np.asarray(img, dtype=np.uint8),
+                            min_pixels=min_pixels,
+                            max_pixels=max_pixels,
+                            n_threads=n_threads,
+                            use_pairing=use_pairing,
+                        )
+                    ]
+
+                for enc in enc_list:
+                    flat_embds = np.ascontiguousarray(enc.embds, dtype=np.float32).reshape(-1)
+                    n_tok = int(enc.n_tokens)
+                    pos3d = np.zeros(n_tok * 3, dtype=np.uint32)
+                    thw_c = (ctypes.c_uint32 * 3)(*enc.grid_thw)
+                    next_rope = int(
+                        self._lib.lila_asi_build_mrope_grid(
+                            rope_pos,
+                            thw_c,
+                            pos3d.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
+                            pos3d.size,
+                        )
+                    )
+                    rc = self._lib.lila_asi_eval_embd(
+                        self._session,
+                        flat_embds.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                        n_tok,
+                        kv_pos,
+                        pos3d.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
+                        None,
+                        1,  # LILA_ASI_MROPE_INTERLEAVED
+                        next_rope,
+                        None,
+                        None,
+                    )
+                    if rc != 0:
+                        raise RuntimeError(f"lila_asi_eval_embd failed with rc={rc}")
+                    kv_pos += n_tok
+                    rope_pos = next_rope
+
+                ve_arr = (ctypes.c_int32 * 1)(vis_end)
+                if self._lib.lila_asi_eval_batch(self._session, ve_arr, 1, kv_pos, self._logits) != 0:
+                    raise RuntimeError("Failed evaluating <|vision_end|>")
+                kv_pos += 1
+                rope_pos += 1
+
+            tail_str = f"{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            tail_ids = self.tokenizer.encode(
+                tail_str,
+                allow_special=("<|im_end|>", "<|im_start|>", "<think>", "</think>"),
+            )
+            tail_arr = (ctypes.c_int32 * len(tail_ids))(*tail_ids)
+            if self._lib.lila_asi_eval_batch(self._session, tail_arr, len(tail_ids), kv_pos, self._logits) != 0:
+                raise RuntimeError("Failed evaluating multimodal text suffix")
+            kv_pos += len(tail_ids)
+
+            rope_delta = int(self._lib.lila_asi_session_get_rope_delta(self._session))
+            gen_ids: List[int] = []
+            inc_dec = IncrementalBpeUtf8Decoder(self.tokenizer)
+            chunks: List[str] = []
+            for _ in range(max_tokens):
+                nxt = int(
+                    self._lib.lila_asi_sample(
+                        self._logits,
+                        self._cfg.vocab_size,
+                        float(temperature),
+                        20,
+                        0.95,
+                        ctypes.byref(self._rng),
+                    )
+                )
+                if nxt < 0 or nxt in (im_end, eot):
+                    break
+                gen_ids.append(nxt)
+                chunks.append(inc_dec.decode_token(nxt, final=False))
+                if self._lib.lila_asi_eval_token(self._session, nxt, kv_pos, self._logits) != 0:
+                    break
+                kv_pos += 1
+            chunks.append(inc_dec.flush())
+            return {
+                "text": "".join(chunks).strip(),
+                "tokens": gen_ids,
+                "rope_delta": rope_delta,
+                "evidence_ledger": ledger_records,
+            }
+
     def close(self) -> None:
         self._cached_prefix_ids = None
         self._cached_prefix_text = None
         self._session_token_ids = []
+        self.close_vision()
         self._free_e05_locked()
         if getattr(self, "_session", None):
             self._lib.lila_asi_session_free(self._session)
@@ -1713,6 +2118,127 @@ class AsiRuntime:
             if tail:
                 yield {"choices": [{"delta": {"content": tail}}]}
 
+    def cp_fork(self, label: Optional[str] = None) -> int:
+        """Anchor (E06): Fork a Copy-on-Write checkpoint slot of the current session state."""
+        with self._lock:
+            if not self._session or not self._supports_anchor:
+                raise RuntimeError("Anchor state-tree ABI is unavailable on this session")
+            n_tokens = len(self._session_token_ids)
+            if n_tokens <= 0:
+                raise RuntimeError("Cannot fork Anchor checkpoint before evaluating tokens")
+            cp_id = ctypes.c_uint32(0)
+            lbl_b = label.encode("utf-8") if label else None
+            rc = self._lib.lila_asi_cp_fork(
+                self._session,
+                ctypes.c_uint32(n_tokens),
+                self._rng.value,
+                lbl_b,
+                ctypes.byref(cp_id),
+            )
+            if rc != 0:
+                raise RuntimeError(f"lila_asi_cp_fork failed (rc={rc}; unsupported arch or tree full)")
+            if not hasattr(self, "_anchor_cp_ids"):
+                self._anchor_cp_ids: List[int] = []
+            if int(cp_id.value) not in self._anchor_cp_ids:
+                self._anchor_cp_ids.append(int(cp_id.value))
+            return int(cp_id.value)
+
+    def cp_restore(self, cp_id: int) -> int:
+        """Anchor (E06): Restore session state (KV/SSM/M-RoPE/RNG) to checkpoint cp_id."""
+        with self._lock:
+            if not self._session or not self._supports_anchor:
+                raise RuntimeError("Anchor state-tree ABI is unavailable on this session")
+            out_n = ctypes.c_uint32(0)
+            out_rng = ctypes.c_uint64(0)
+            rc = self._lib.lila_asi_cp_restore(
+                self._session,
+                ctypes.c_uint32(int(cp_id)),
+                ctypes.byref(out_n),
+                ctypes.byref(out_rng),
+            )
+            if rc != 0:
+                raise RuntimeError(f"lila_asi_cp_restore failed for cp_id={cp_id} (rc={rc})")
+            self._rng = ctypes.c_uint64(int(out_rng.value))
+            n_tok = int(out_n.value)
+            if len(self._session_token_ids) >= n_tok:
+                self._session_token_ids = list(self._session_token_ids[:n_tok])
+            else:
+                self._session_token_ids = []
+            return n_tok
+
+    def cp_list(self) -> List[Dict[str, Any]]:
+        """Anchor (E06): Inspect all known live checkpoint slots for this session."""
+        with self._lock:
+            if not self._session or not self._supports_anchor:
+                return []
+            status_map = {0: "active", 1: "committed", 2: "abandoned"}
+            seen = list(getattr(self, "_anchor_cp_ids", []))
+            for probe in range(1, 33):
+                if probe not in seen:
+                    seen.append(probe)
+            out: List[Dict[str, Any]] = []
+            for cid in seen:
+                info = _AsiCheckpointInfo()
+                if self._lib.lila_asi_cp_get_info(self._session, ctypes.c_uint32(cid), ctypes.byref(info)) == 0:
+                    out.append(
+                        {
+                            "cp_id": int(info.cp_id),
+                            "parent_cp_id": int(info.parent_cp_id),
+                            "rng_state": int(info.rng_state),
+                            "branch_id": int(info.prov.branch_id),
+                            "parent_branch_id": int(info.prov.parent_branch_id),
+                            "state_version": int(info.prov.state_version),
+                            "n_tokens": int(info.prov.n_tokens),
+                            "status": status_map.get(int(info.prov.status), f"unknown({info.prov.status})"),
+                            "label": info.label.decode("utf-8", "replace"),
+                        }
+                    )
+            return out
+
+    def cp_cow_stats(self) -> Dict[str, int]:
+        """Anchor (E06): Return Copy-on-Write KV page sharing statistics."""
+        with self._lock:
+            if not self._session or not self._supports_anchor:
+                return {}
+            st = _AsiCowStats()
+            if self._lib.lila_asi_cp_cow_stats(self._session, ctypes.byref(st)) != 0:
+                return {}
+            return {
+                "live_slots": int(st.live_slots),
+                "max_slots": int(st.max_slots),
+                "physical_kv_pages": int(st.physical_kv_pages),
+                "logical_kv_pages": int(st.logical_kv_pages),
+                "shared_kv_pages": int(st.shared_kv_pages),
+                "cow_reuses": int(st.cow_reuses),
+                "cow_allocs": int(st.cow_allocs),
+            }
+
+    @staticmethod
+    def _decode_image_url_to_rgb(url: str) -> object:
+        import base64
+        import io
+        from urllib.parse import unquote, urlparse
+        import numpy as np
+        from PIL import Image
+
+        if url.startswith("data:"):
+            if "," not in url:
+                raise ValueError("Invalid data URI for image_url")
+            _, b64_data = url.split(",", 1)
+            raw = base64.b64decode(b64_data)
+            with Image.open(io.BytesIO(raw)) as im:
+                return np.asarray(im.convert("RGB"), dtype=np.uint8)
+        parsed = urlparse(url)
+        if parsed.scheme == "file":
+            p = Path(unquote(parsed.path))
+            with Image.open(p) as im:
+                return np.asarray(im.convert("RGB"), dtype=np.uint8)
+        if not parsed.scheme:
+            p = Path(url).expanduser()
+            with Image.open(p) as im:
+                return np.asarray(im.convert("RGB"), dtype=np.uint8)
+        raise ValueError(f"Unsupported image_url scheme: {parsed.scheme}")
+
     def create_chat_completion(
         self,
         messages: List[Dict],
@@ -1724,8 +2250,98 @@ class AsiRuntime:
         cancel_event: Optional[threading.Event] = None,
         active_tools: Optional[Sequence[Any]] = None,
         max_think_tokens: int = 0,
-        **_: object,
+        **kwargs: object,
     ):
+        mm_images: List[object] = []
+        mm_system_parts: List[str] = []
+        mm_texts: List[str] = []
+        for m in messages:
+            role = str(m.get("role", "user") or "user")
+            content = m.get("content", "")
+            msg_texts: List[str] = []
+            if isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    ptype = part.get("type")
+                    if ptype == "text":
+                        txt = str(part.get("text", ""))
+                        if txt:
+                            msg_texts.append(txt)
+                    elif ptype == "image_url":
+                        img_obj = part.get("image_url")
+                        url = img_obj.get("url", "") if isinstance(img_obj, dict) else str(img_obj or "")
+                        if url:
+                            mm_images.append(self._decode_image_url_to_rgb(url))
+            elif isinstance(content, str) and content:
+                msg_texts.append(content)
+            joined_msg = "\n".join(msg_texts).strip()
+            if joined_msg:
+                if role == "system":
+                    mm_system_parts.append(joined_msg)
+                else:
+                    mm_texts.append(joined_msg)
+
+        if mm_images:
+            if self._vision_session is None:
+                raise RuntimeError("Multimodal image_url supplied cleanly, but no .asiv vision sidecar is attached")
+            mm_res = self.create_multimodal_completion(
+                prompt="\n".join(mm_texts).strip(),
+                images=mm_images,
+                system_prompt="\n\n".join(mm_system_parts) or None,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                n_threads=int(getattr(self, "_n_threads", 2) or 2),
+                adaptive=bool(kwargs.get("adaptive", False)),
+            )
+            text = str(mm_res.get("text", ""))
+            if stream:
+                def _one_chunk() -> Iterator[Dict]:
+                    yield {"choices": [{"delta": {"content": text}}]}
+                return _one_chunk()
+            return {"choices": [{"message": {"role": "assistant", "content": text}}], "multimodal": mm_res}
+
+        mm_images: List[object] = []
+        mm_texts: List[str] = []
+        for m in messages:
+            content = m.get("content", "")
+            if isinstance(content, list):
+                part_texts: List[str] = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    ptype = part.get("type")
+                    if ptype == "text":
+                        txt = str(part.get("text", ""))
+                        if txt:
+                            part_texts.append(txt)
+                    elif ptype == "image_url":
+                        img_obj = part.get("image_url")
+                        url = img_obj.get("url", "") if isinstance(img_obj, dict) else str(img_obj or "")
+                        if url:
+                            mm_images.append(self._decode_image_url_to_rgb(url))
+                if part_texts:
+                    mm_texts.append("\n".join(part_texts))
+            elif isinstance(content, str) and content:
+                mm_texts.append(content)
+
+        if mm_images:
+            if self._vision_session is None:
+                raise RuntimeError("Multimodal image_url supplied cleanly, but no .asiv vision sidecar is attached")
+            mm_res = self.create_multimodal_completion(
+                prompt="\n".join(mm_texts).strip(),
+                images=mm_images,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                adaptive=bool(kwargs.get("adaptive", False)),
+            )
+            text = str(mm_res.get("text", ""))
+            if stream:
+                def _one_chunk() -> Iterator[Dict]:
+                    yield {"choices": [{"delta": {"content": text}}]}
+                return _one_chunk()
+            return {"choices": [{"message": {"role": "assistant", "content": text}}], "multimodal": mm_res}
+
         if stream:
             return self._stream_tokens(
                 messages,

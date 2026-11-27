@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 *.o
 *.asi
+*.asiv
 *.gguf
 build/
 *.egg-info/

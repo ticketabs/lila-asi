@@ -1,14 +1,12 @@
 #include "asi_state_centric.h"
 #include "asi_sc_internal.h"
+#include "asi_platform.h"
 
 #include <errno.h>
 #include <math.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 /* =========================================================================
  * 1. Self-Contained FIPS 180-4 SHA-256 (Zero External Dependencies)
@@ -149,7 +147,7 @@ void lila_asi_sha256(const void *data, size_t len, uint8_t out_hash[32])
 
 static uint64_t g_sc_crc64_tab[256];
 static uint32_t g_sc_crc32_tab[256];
-static pthread_once_t g_sc_crc_once = PTHREAD_ONCE_INIT;
+static AsiOnce g_sc_crc_once = ASI_ONCE_INIT;
 
 static void sc_crc_init(void)
 {
@@ -175,7 +173,7 @@ static void sc_crc_init(void)
 
 static uint64_t sc_crc64_update(uint64_t crc, const uint8_t *data, size_t len)
 {
-    pthread_once(&g_sc_crc_once, sc_crc_init);
+    asi_call_once(&g_sc_crc_once, sc_crc_init);
     for (size_t i = 0; i < len; ++i)
     {
         crc = (crc << 8) ^ g_sc_crc64_tab[((crc >> 56) ^ data[i]) & 0xFFu];
@@ -185,7 +183,7 @@ static uint64_t sc_crc64_update(uint64_t crc, const uint8_t *data, size_t len)
 
 static uint32_t sc_crc32(const uint8_t *data, size_t len)
 {
-    pthread_once(&g_sc_crc_once, sc_crc_init);
+    asi_call_once(&g_sc_crc_once, sc_crc_init);
     uint32_t c = 0xFFFFFFFFu;
     for (size_t i = 0; i < len; ++i)
     {
@@ -219,7 +217,14 @@ typedef struct {
     ScKvPage          **pages;     /* [n_fa * n_pages_per_layer] */
     int32_t            *tokens;    /* optional [prov.n_tokens] */
     int                 has_tokens;
+    int64_t             mrope_pos_delta;
 } ScCheckpointSlot;
+
+static int sc_session_is_qwen35(const LilaAsiSession *session)
+{
+    const AsiV2Cartridge *cart = lila_asi_sc_get_cartridge(session);
+    return (cart && cart->header.arch_id == ASI_ARCH_HYBRID_QWEN35) ? 1 : 0;
+}
 
 struct AsiStateTree {
     LilaAsiSession     *session;
@@ -366,7 +371,7 @@ int lila_asi_cp_fork(LilaAsiSession *session,
                      const char *label,
                      uint32_t *out_cp_id)
 {
-    if (!session || n_tokens == 0) return -1;
+    if (!session || n_tokens == 0 || !sc_session_is_qwen35(session)) return -1;
     AsiArchSession *arch_s = lila_asi_sc_get_arch_session(session);
     if (!arch_s) return -1;
 
@@ -512,6 +517,7 @@ int lila_asi_cp_fork(LilaAsiSession *session,
     slot->pages = pages;
     slot->tokens = tok_copy;
     slot->has_tokens = has_tokens;
+    slot->mrope_pos_delta = qwen35_sc_get_rope_delta(arch_s);
 
     tree->active_parent_cp_id = cp_id;
     qwen35_sc_mark_kv_clean(arch_s, n_tokens);
@@ -525,7 +531,7 @@ int lila_asi_cp_restore(LilaAsiSession *session,
                         uint32_t *out_n_tokens,
                         uint64_t *out_rng_state)
 {
-    if (!session || cp_id == ASI_CP_INVALID) return -1;
+    if (!session || cp_id == ASI_CP_INVALID || !sc_session_is_qwen35(session)) return -1;
     AsiArchSession *arch_s = lila_asi_sc_get_arch_session(session);
     AsiStateTree *tree = lila_asi_sc_ensure_state_tree(session);
     if (!arch_s || !tree) return -1;
@@ -592,6 +598,7 @@ int lila_asi_cp_restore(LilaAsiSession *session,
     free(k_ptrs);
     free(v_ptrs);
     if (rc != 0) return -1;
+    qwen35_sc_set_rope_delta(arch_s, target->mrope_pos_delta);
 
     /* Mint fresh child branch_id for the newly restored active session */
     tree->active_parent_cp_id = target->cp_id;
@@ -609,7 +616,7 @@ int lila_asi_cp_restore(LilaAsiSession *session,
 
 int lila_asi_cp_delete(LilaAsiSession *session, uint32_t cp_id)
 {
-    if (!session || cp_id == ASI_CP_INVALID) return -1;
+    if (!session || cp_id == ASI_CP_INVALID || !sc_session_is_qwen35(session)) return -1;
     AsiStateTree *tree = lila_asi_sc_ensure_state_tree(session);
     if (!tree) return -1;
     ScCheckpointSlot *slot = sc_find_slot(tree, cp_id);
@@ -628,7 +635,7 @@ int lila_asi_cp_get_info(const LilaAsiSession *session,
                          uint32_t cp_id,
                          AsiCheckpointInfo *out_info)
 {
-    if (!session || !out_info || cp_id == ASI_CP_INVALID) return -1;
+    if (!session || !out_info || cp_id == ASI_CP_INVALID || !sc_session_is_qwen35(session)) return -1;
     const AsiStateTree *tree = lila_asi_sc_get_state_tree(session);
     if (!tree) return -1;
     const ScCheckpointSlot *slot = sc_find_slot_const(tree, cp_id);
@@ -646,7 +653,7 @@ int lila_asi_cp_get_info(const LilaAsiSession *session,
 int lila_asi_session_get_provenance(const LilaAsiSession *session,
                                     AsiBranchProvenance *out_prov)
 {
-    if (!session || !out_prov) return -1;
+    if (!session || !out_prov || !sc_session_is_qwen35(session)) return -1;
     const AsiStateTree *tree = lila_asi_sc_get_state_tree(session);
     if (!tree)
     {
@@ -663,7 +670,7 @@ int lila_asi_session_get_provenance(const LilaAsiSession *session,
 
 int lila_asi_cp_commit(LilaAsiSession *session, uint32_t cp_id)
 {
-    if (!session || cp_id == ASI_CP_INVALID) return -1;
+    if (!session || cp_id == ASI_CP_INVALID || !sc_session_is_qwen35(session)) return -1;
     AsiStateTree *tree = lila_asi_sc_ensure_state_tree(session);
     if (!tree) return -1;
     ScCheckpointSlot *slot = sc_find_slot(tree, cp_id);
@@ -684,7 +691,7 @@ int lila_asi_cp_commit(LilaAsiSession *session, uint32_t cp_id)
 
 int lila_asi_cp_abandon(LilaAsiSession *session, uint32_t cp_id)
 {
-    if (!session || cp_id == ASI_CP_INVALID) return -1;
+    if (!session || cp_id == ASI_CP_INVALID || !sc_session_is_qwen35(session)) return -1;
     AsiStateTree *tree = lila_asi_sc_ensure_state_tree(session);
     if (!tree) return -1;
     ScCheckpointSlot *slot = sc_find_slot(tree, cp_id);
@@ -696,7 +703,7 @@ int lila_asi_cp_abandon(LilaAsiSession *session, uint32_t cp_id)
 
 int lila_asi_cp_cow_stats(const LilaAsiSession *session, AsiCowStats *out_stats)
 {
-    if (!session || !out_stats) return -1;
+    if (!session || !out_stats || !sc_session_is_qwen35(session)) return -1;
     memset(out_stats, 0, sizeof(*out_stats));
     out_stats->max_slots = ASI_STATE_TREE_MAX_SLOTS;
     const AsiStateTree *tree = lila_asi_sc_get_state_tree(session);
@@ -750,7 +757,7 @@ int lila_asi_session_state_sha256(const LilaAsiSession *session,
                                   uint32_t n_tokens,
                                   uint8_t out_sha256[32])
 {
-    if (!session || !out_sha256 || n_tokens == 0) return -1;
+    if (!session || !out_sha256 || n_tokens == 0 || !sc_session_is_qwen35(session)) return -1;
     const AsiArchSession *arch_s = lila_asi_sc_get_arch_session(session);
     if (!arch_s) return -1;
 
@@ -813,7 +820,7 @@ int lila_asi_cp_save_file(const LilaAsiSession *session,
                           const uint8_t key_hash[32],
                           const char *filepath)
 {
-    if (!session || cp_id == ASI_CP_INVALID || !key_hash || !filepath || filepath[0] == '\0')
+    if (!session || cp_id == ASI_CP_INVALID || !key_hash || !filepath || filepath[0] == '\0' || !sc_session_is_qwen35(session))
         return -1;
     const AsiArchSession *arch_s = lila_asi_sc_get_arch_session(session);
     const AsiStateTree *tree = lila_asi_sc_get_state_tree(session);
@@ -895,7 +902,7 @@ int lila_asi_cp_save_file(const LilaAsiSession *session,
     size_t tcap = flen + 64;
     char *tmp_path = (char *)malloc(tcap);
     if (!tmp_path) return -1;
-    int tn = snprintf(tmp_path, tcap, "%s.tmp.%ld", filepath, (long)getpid());
+    int tn = snprintf(tmp_path, tcap, "%s.tmp.%ld", filepath, asi_getpid());
     if (tn <= 0 || (size_t)tn >= tcap) { free(tmp_path); return -1; }
 
     FILE *fp = fopen(tmp_path, "wb");
@@ -935,15 +942,11 @@ int lila_asi_cp_save_file(const LilaAsiSession *session,
     if (ok && token_bytes > 0 && fwrite(slot->tokens, 1, (size_t)token_bytes, fp) != (size_t)token_bytes) ok = 0;
 
     if (ok && fflush(fp) != 0) ok = 0;
-    if (ok)
-    {
-        int fd = fileno(fp);
-        if (fd >= 0 && fsync(fd) != 0 && errno != EINVAL && errno != EROFS) ok = 0;
-    }
+    if (ok && asi_fsync_file(fp) != 0) ok = 0;
     if (fclose(fp) != 0) ok = 0;
-    if (!ok || rename(tmp_path, filepath) != 0)
+    if (!ok || asi_atomic_rename(tmp_path, filepath) != 0)
     {
-        unlink(tmp_path);
+        asi_unlink(tmp_path);
         free(tmp_path);
         return -1;
     }
@@ -957,7 +960,7 @@ int lila_asi_cp_load_file(LilaAsiSession *session,
                           const char *label,
                           uint32_t *out_cp_id)
 {
-    if (!session || !expected_key_hash || !filepath || filepath[0] == '\0') return -1;
+    if (!session || !expected_key_hash || !filepath || filepath[0] == '\0' || !sc_session_is_qwen35(session)) return -1;
     AsiArchSession *arch_s = lila_asi_sc_get_arch_session(session);
     AsiStateTree *tree = lila_asi_sc_ensure_state_tree(session);
     if (!arch_s || !tree) return -1;
@@ -1139,11 +1142,7 @@ static int sc_wal_append_line(LilaAsiWal *wal, const char *body)
     if (!fp) return -1;
     int ok = (fprintf(fp, "%08x|%s\n", crc, body) > 0);
     if (ok && fflush(fp) != 0) ok = 0;
-    if (ok)
-    {
-        int fd = fileno(fp);
-        if (fd >= 0 && fsync(fd) != 0 && errno != EINVAL && errno != EROFS) ok = 0;
-    }
+    if (ok && asi_fsync_file(fp) != 0) ok = 0;
     if (fclose(fp) != 0) ok = 0;
     return ok ? 0 : -1;
 }
@@ -1153,7 +1152,7 @@ LilaAsiWal *lila_asi_wal_open(const char *wal_dir,
                               const uint8_t key_hash[32])
 {
     if (!wal_dir || !session_id || !key_hash) return NULL;
-    if (mkdir(wal_dir, 0755) != 0 && errno != EEXIST) return NULL;
+    if (asi_mkdir(wal_dir) != 0) return NULL;
 
     LilaAsiWal *wal = (LilaAsiWal *)calloc(1, sizeof(LilaAsiWal));
     if (!wal) return NULL;
@@ -1178,7 +1177,7 @@ int lila_asi_wal_checkpoint(LilaAsiWal *wal,
                             const char *label,
                             uint32_t *out_cp_id)
 {
-    if (!wal || !session || n_tokens == 0) return -1;
+    if (!wal || !session || n_tokens == 0 || !sc_session_is_qwen35(session)) return -1;
     uint32_t cp_id = ASI_CP_INVALID;
     if (lila_asi_cp_fork(session, n_tokens, rng_state, label ? label : "wal_ckpt", &cp_id) != 0)
         return -1;
@@ -1254,7 +1253,7 @@ int lila_asi_wal_resume(LilaAsiWal *wal,
                         float *out_last_logits,
                         AsiWalResumeInfo *out_info)
 {
-    if (!wal || !session) return -1;
+    if (!wal || !session || !sc_session_is_qwen35(session)) return -1;
     FILE *fp = fopen(wal->wal_path, "r");
     if (!fp) return -1;
 

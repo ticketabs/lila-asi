@@ -15,21 +15,40 @@ ASI_DIR = Path(__file__).resolve().parent
 if str(ASI_DIR) not in sys.path:
     sys.path.insert(0, str(ASI_DIR))
 
-from asi_v2 import (
-    ARCH_IDS,
-    SEC_CHAT_TEMPLATE,
-    SEC_METADATA,
-    SEC_MODEL_CONFIG,
-    SEC_TOKENIZER,
-    SEC_VISION,
-    SEC_WEIGHTS,
-    TENSOR_LAYOUT_AVX2_REPACK,
-    TENSOR_LAYOUT_ROW_MAJOR,
-    pack_model_config,
-    pack_weights_section,
-    write_asi_v2,
-)
-from gguf_reader import GgufFile
+try:
+    from .asi_v2 import (
+        ARCH_IDS,
+        SEC_CHAT_TEMPLATE,
+        SEC_METADATA,
+        SEC_MODEL_CONFIG,
+        SEC_TOKENIZER,
+        SEC_VISION,
+        SEC_WEIGHTS,
+        TENSOR_LAYOUT_AVX2_REPACK,
+        TENSOR_LAYOUT_ROW_MAJOR,
+        pack_model_config,
+        pack_weights_section,
+        write_asi_v2,
+    )
+    from .gguf_reader import GgufFile
+    from .gguf_to_asiv import convert_mmproj_to_asiv, is_vision_gguf
+except ImportError:
+    from asi_v2 import (
+        ARCH_IDS,
+        SEC_CHAT_TEMPLATE,
+        SEC_METADATA,
+        SEC_MODEL_CONFIG,
+        SEC_TOKENIZER,
+        SEC_VISION,
+        SEC_WEIGHTS,
+        TENSOR_LAYOUT_AVX2_REPACK,
+        TENSOR_LAYOUT_ROW_MAJOR,
+        pack_model_config,
+        pack_weights_section,
+        write_asi_v2,
+    )
+    from gguf_reader import GgufFile
+    from gguf_to_asiv import convert_mmproj_to_asiv, is_vision_gguf
 
 _ARCH_MAP = {
     "llama": "dense_llama",
@@ -45,7 +64,7 @@ def _meta(md: Dict[str, Any], arch: str, key: str, default: Any = 0) -> Any:
     return md.get(f"{arch}.{key}", default)
 
 
-def build_model_config(gguf: GgufFile) -> Tuple[int, bytes]:
+def build_model_config(gguf: GgufFile, *, max_ctx: int = 0) -> Tuple[int, bytes]:
     md = gguf.metadata
     arch_str = str(md.get("general.architecture", "unknown"))
     asi_arch_name = _ARCH_MAP.get(arch_str, "unknown")
@@ -53,6 +72,8 @@ def build_model_config(gguf: GgufFile) -> Tuple[int, bytes]:
 
     tokens = md.get("tokenizer.ggml.tokens")
     vocab_size = len(tokens) if isinstance(tokens, list) else int(_meta(md, arch_str, "vocab_size", 0))
+    raw_max_ctx = int(_meta(md, arch_str, "context_length", 2048))
+    eff_max_ctx = int(max_ctx) if int(max_ctx) > 0 else raw_max_ctx
 
     cfg = pack_model_config(
         arch_id=arch_id,
@@ -67,7 +88,7 @@ def build_model_config(gguf: GgufFile) -> Tuple[int, bytes]:
             // max(1, int(_meta(md, arch_str, "attention.head_count", 1)))
         ),
         vocab_size=vocab_size,
-        max_seq_len=int(_meta(md, arch_str, "context_length", 2048)),
+        max_seq_len=eff_max_ctx,
         rope_dim=int(_meta(md, arch_str, "rope.dimension_count", 0)),
         rope_theta=float(_meta(md, arch_str, "rope.freq_base", 10000.0)),
         rms_norm_eps=float(_meta(md, arch_str, "attention.layer_norm_rms_epsilon", 1e-6)),
@@ -141,12 +162,19 @@ def pack_gguf_tensors(gguf: GgufFile, *, repack_avx2: bool = False) -> bytes:
 
 def convert_gguf_to_asi_v2(
     gguf_path: Path,
-    out_path: Path,
+    out_path: Optional[Path] = None,
     *,
     mmproj_path: Optional[Path] = None,
+    max_ctx: int = 0,
 ) -> Path:
+    gguf_path = Path(gguf_path)
     gguf = GgufFile(gguf_path, skip_large_arrays=False)
-    arch_id, cfg_bytes = build_model_config(gguf)
+    if is_vision_gguf(gguf):
+        target = Path(out_path) if out_path is not None else gguf_path.with_suffix(".asiv")
+        return convert_mmproj_to_asiv(gguf_path, target, gguf=gguf)
+
+    target = Path(out_path) if out_path is not None else gguf_path.with_suffix(".asi")
+    arch_id, cfg_bytes = build_model_config(gguf, max_ctx=max_ctx)
     weights_bytes = pack_gguf_tensors(gguf)
     tok_bytes = build_tokenizer_section(gguf)
 
@@ -162,10 +190,10 @@ def convert_gguf_to_asi_v2(
         sections.append((SEC_CHAT_TEMPLATE, 0, chat_tmpl.encode("utf-8")))
         flags |= 1 << 4  # ASI_V2_FLAG_HAS_CHAT_TEMPLATE
 
+    asiv_out: Optional[Path] = None
     if mmproj_path is not None:
-        mm_gguf = GgufFile(mmproj_path, skip_large_arrays=False)
-        mm_weights = pack_gguf_tensors(mm_gguf)
-        sections.append((SEC_VISION, 0, mm_weights))
+        asiv_out = target.with_suffix(".asiv")
+        convert_mmproj_to_asiv(Path(mmproj_path), asiv_out)
         flags |= 1 << 0  # ASI_V2_FLAG_HAS_VISION
 
     meta = {
@@ -177,19 +205,22 @@ def convert_gguf_to_asi_v2(
         "n_tensors": len(gguf.tensors),
         "has_vision": mmproj_path is not None,
     }
+    if asiv_out is not None:
+        meta["vision_sidecar"] = asiv_out.name
     sections.append((SEC_METADATA, 0, json.dumps(meta, separators=(",", ":")).encode("utf-8")))
 
-    return write_asi_v2(out_path, arch_id=arch_id, flags=flags, sections=sections)
+    return write_asi_v2(target, arch_id=arch_id, flags=flags, sections=sections)
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Convert GGUF model to ASI v2 cartridge")
-    ap.add_argument("gguf", type=Path, help="Input model .gguf")
-    ap.add_argument("output", type=Path, help="Output .asi v2 cartridge")
-    ap.add_argument("--mmproj", type=Path, default=None, help="Optional vision projector .gguf")
+    ap = argparse.ArgumentParser(description="Convert any GGUF model or vision mmproj to .asi / .asiv cartridge")
+    ap.add_argument("gguf", type=Path, help="Input model or vision .gguf")
+    ap.add_argument("output", type=Path, nargs="?", default=None, help="Output .asi or .asiv path (auto-detected if omitted)")
+    ap.add_argument("--mmproj", type=Path, default=None, help="Optional vision projector .gguf (emits sibling .asiv)")
+    ap.add_argument("--max-ctx", type=int, default=0, help="Override metadata max context length")
     args = ap.parse_args()
 
-    out = convert_gguf_to_asi_v2(args.gguf, args.output, mmproj_path=args.mmproj)
+    out = convert_gguf_to_asi_v2(args.gguf, args.output, mmproj_path=args.mmproj, max_ctx=args.max_ctx)
     print(f"Converted {args.gguf.name} -> {out} ({out.stat().st_size / (1024 * 1024):.2f} MiB)")
     return 0
 

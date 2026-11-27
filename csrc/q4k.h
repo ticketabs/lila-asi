@@ -19,9 +19,12 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include "asi_cpu.h"
 
 #if defined(__AVX2__) || defined(__AVX512F__)
 #include <immintrin.h>
+#elif defined(__SSE2__)
+#include <xmmintrin.h>
 #elif defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
 #endif
@@ -2526,47 +2529,966 @@ static inline void dequant_q5k_block(float *out, const uint8_t *block) {
 
 static inline int lila_quant_is_supported(uint32_t quant_type) {
     switch (quant_type) {
-        case 0u:  /* F32 */
-        case 1u:  /* F16 */
-        case 2u:  /* Q4_0 */
-        case 8u:  /* Q8_0 */
-        case 12u: /* Q4_K */
-        case 13u: /* Q5_K */
-        case 14u: /* Q6_K */
-        case 30u: /* BF16 */
+        case 0u:   /* F32 */
+        case 1u:   /* F16 */
+        case 2u:   /* Q4_0 */
+        case 8u:   /* Q8_0 */
+        case 12u:  /* Q4_K */
+        case 13u:  /* Q5_K */
+        case 14u:  /* Q6_K */
+        case 30u:  /* BF16 */
+        case 100u: /* ASI_QUANT_Q4_REPACK (4.25 bpw) */
+        case 101u: /* ASI_QUANT_Q3_SPLITLUT (3.125 bpw) */
             return 1;
         default:
             return 0;
     }
 }
 
+/* =========================================================================
+ * E07 / v2.6 Formats:
+ *   100: Q4_REPACK (4.25 bpw: 2B fp16 scale + 32B nibbles per 64 weights)
+ *   101: Q3_SPLITLUT (3.125 bpw: 64-row x 128-col split hi2/lo1 LUT tiles)
+ * ========================================================================= */
+#define ASI_QUANT_ID_Q4_REPACK    100u
+#define ASI_QUANT_ID_Q3_SPLITLUT  101u
+
+#define Q4_REPACK_GROUP_SIZE      64
+#define Q4_REPACK_BLOCK_SIZE      34
+
+#define Q3_SPLITLUT_TILE_ROWS     64
+#define Q3_SPLITLUT_BLK_COLS      128
+#define Q3_SPLITLUT_BLK_HI2_BYTES 2048
+#define Q3_SPLITLUT_BLK_LO1_BYTES 1024
+#define Q3_SPLITLUT_BLK_SC_BYTES  128
+#define Q3_SPLITLUT_BLK_BYTES     3200
+
+/* Register-safe cap on fused multi-token GEMV width for 16-YMM AVX2 targets */
+#define ASI_SPEC_MAX_BATCH_16YMM  3
+
+typedef struct {
+    uint16_t d;      /* fp16 scale for 64 weights */
+    uint8_t  qs[32]; /* lo nibbles = w[0..31]+8, hi nibbles = w[32..63]+8 */
+} LilaQ4RepackBlock;
+
+typedef struct {
+    _Alignas(32) int8_t qs[Q4_REPACK_GROUP_SIZE];
+    float d;
+    float bias;      /* -8.0f * d * sum(qs[0..63]) */
+    uint8_t _pad[24];/* pad to 96 bytes so qs[] stays 32-byte aligned across arrays */
+} LilaQ8_64Block;
+
+typedef struct {
+    _Alignas(16) int8_t lut_hi2[64][16];
+    _Alignas(16) int8_t lut_lo1[32][16];
+    float xs_hi2;
+    float xs_lo1;
+    uint8_t _pad[8];
+} LilaQ3LutBlock;
+
+static inline LilaQ8_64Block *lila_q8_64_alloc(size_t n) {
+    if (n == 0) return NULL;
+#if defined(_WIN32)
+    return (LilaQ8_64Block *)_aligned_malloc(n * sizeof(LilaQ8_64Block), 32);
+#else
+    return (LilaQ8_64Block *)aligned_alloc(32, n * sizeof(LilaQ8_64Block));
+#endif
+}
+
+static inline void lila_q8_64_free(void *p) {
+#if defined(_WIN32)
+    _aligned_free(p);
+#else
+    free(p);
+#endif
+}
+
+static inline void dequant_q4_repack_block(float *out, const uint8_t *block) {
+    uint16_t d_raw;
+    memcpy(&d_raw, block, 2);
+    float d = fp16_to_fp32(d_raw);
+    const uint8_t *qs = block + 2;
+    for (int l = 0; l < 32; ++l) {
+        int x0 = (int)(qs[l] & 0x0Fu) - 8;
+        int x1 = (int)(qs[l] >> 4) - 8;
+        out[l]      = d * (float)x0;
+        out[l + 32] = d * (float)x1;
+    }
+}
+
+static inline void dequant_q4_repack_row(float *out, const uint8_t *row_data, int cols) {
+    int n_blocks = (cols + Q4_REPACK_GROUP_SIZE - 1) / Q4_REPACK_GROUP_SIZE;
+    float tmp[Q4_REPACK_GROUP_SIZE];
+    for (int b = 0; b < n_blocks; ++b) {
+        int base = b * Q4_REPACK_GROUP_SIZE;
+        int avail = cols - base;
+        if (avail >= Q4_REPACK_GROUP_SIZE) {
+            dequant_q4_repack_block(out + base, row_data + (size_t)b * Q4_REPACK_BLOCK_SIZE);
+        } else {
+            dequant_q4_repack_block(tmp, row_data + (size_t)b * Q4_REPACK_BLOCK_SIZE);
+            memcpy(out + base, tmp, (size_t)avail * sizeof(float));
+        }
+    }
+}
+
+static inline void dequant_q3_splitlut_row(float *out, const uint8_t *matrix_data, int row, int cols) {
+    int n_blk128 = (cols + Q3_SPLITLUT_BLK_COLS - 1) / Q3_SPLITLUT_BLK_COLS;
+    int tile = row / Q3_SPLITLUT_TILE_ROWS;
+    int lr = row % Q3_SPLITLUT_TILE_ROWS;
+    int bo = lr & 31;
+    int sh = (lr >= 32) ? 4 : 0;
+    const uint8_t *tp = matrix_data + (size_t)tile * (size_t)n_blk128 * Q3_SPLITLUT_BLK_BYTES;
+    for (int blk = 0; blk < n_blk128; ++blk) {
+        const uint8_t *bp_h = tp + (size_t)blk * Q3_SPLITLUT_BLK_BYTES;
+        const uint8_t *bp_l = bp_h + Q3_SPLITLUT_BLK_HI2_BYTES;
+        const uint16_t *sp  = (const uint16_t *)(bp_l + Q3_SPLITLUT_BLK_LO1_BYTES);
+        uint16_t sc_raw;
+        memcpy(&sc_raw, sp + lr, 2);
+        float step = fp16_to_fp32(sc_raw);
+        int base = blk * Q3_SPLITLUT_BLK_COLS;
+        int avail = cols - base;
+        if (avail > Q3_SPLITLUT_BLK_COLS) avail = Q3_SPLITLUT_BLK_COLS;
+        for (int i = 0; i < avail; ++i) {
+            int gh = i >> 1;
+            int gl = i >> 2;
+            uint8_t nib_h = (uint8_t)((bp_h[gh * 32 + bo] >> sh) & 0x0Fu);
+            uint8_t hi2 = (i & 1) ? (uint8_t)((nib_h >> 2) & 0x03u) : (uint8_t)(nib_h & 0x03u);
+            uint8_t nib_l = (uint8_t)((bp_l[gl * 32 + bo] >> sh) & 0x0Fu);
+            uint8_t lo1 = (uint8_t)((nib_l >> (i & 3)) & 0x01u);
+            int q = ((int)hi2 << 1) | (int)lo1;
+            out[base + i] = step * ((float)q - 3.5f);
+        }
+    }
+}
+
+static inline void quantize_vec_q8_64_strided(LilaQ8_64Block *dst, int dst_stride, const float *vec, int cols) {
+    int n_blk = (cols + Q4_REPACK_GROUP_SIZE - 1) / Q4_REPACK_GROUP_SIZE;
+    int use_avx2 = 0;
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    use_avx2 = asi_cpu_has_avx2_fma_f16c();
+#endif
+    for (int b = 0; b < n_blk; ++b) {
+        LilaQ8_64Block *out_b = dst + (size_t)b * (size_t)dst_stride;
+        int base = b * Q4_REPACK_GROUP_SIZE;
+        int avail = cols - base;
+        if (avail > Q4_REPACK_GROUP_SIZE) avail = Q4_REPACK_GROUP_SIZE;
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+        if (use_avx2 && avail == Q4_REPACK_GROUP_SIZE) {
+            const float *vp = vec + base;
+            __m256 sign_mask = _mm256_set1_ps(-0.0f);
+            __m256 vmax = _mm256_setzero_ps();
+            for (int sb = 0; sb < 2; ++sb) {
+                const float *sp = vp + sb * 32;
+                __m256 m0 = _mm256_andnot_ps(sign_mask, _mm256_loadu_ps(sp + 0));
+                __m256 m1 = _mm256_andnot_ps(sign_mask, _mm256_loadu_ps(sp + 8));
+                __m256 m2 = _mm256_andnot_ps(sign_mask, _mm256_loadu_ps(sp + 16));
+                __m256 m3 = _mm256_andnot_ps(sign_mask, _mm256_loadu_ps(sp + 24));
+                vmax = _mm256_max_ps(vmax, _mm256_max_ps(_mm256_max_ps(m0, m1), _mm256_max_ps(m2, m3)));
+            }
+            __m128 m128 = _mm_max_ps(_mm256_castps256_ps128(vmax), _mm256_extractf128_ps(vmax, 1));
+            m128 = _mm_max_ps(m128, _mm_movehl_ps(m128, m128));
+            m128 = _mm_max_ss(m128, _mm_shuffle_ps(m128, m128, 1));
+            float amax = _mm_cvtss_f32(m128);
+            float d = amax / 127.0f;
+            float id = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+            out_b->d = d;
+            __m256 vid = _mm256_set1_ps(id);
+            const __m128i ones8 = _mm_set1_epi8(1);
+            const __m128i ones16_128 = _mm_set1_epi16(1);
+            int32_t sum_q = 0;
+            for (int sb = 0; sb < 2; ++sb) {
+                const float *sp = vp + sb * 32;
+                __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(sp + 0), vid));
+                __m256i i1 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(sp + 8), vid));
+                __m256i i2 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(sp + 16), vid));
+                __m256i i3 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(sp + 24), vid));
+                __m256i p01 = _mm256_permute4x64_epi64(_mm256_packs_epi32(i0, i1), 0xD8);
+                __m256i p23 = _mm256_permute4x64_epi64(_mm256_packs_epi32(i2, i3), 0xD8);
+                __m256i q8  = _mm256_permute4x64_epi64(_mm256_packs_epi16(p01, p23), 0xD8);
+                _mm256_store_si256((__m256i *)(out_b->qs + sb * 32), q8);
+                __m128i qlo = _mm256_castsi256_si128(q8);
+                __m128i qhi = _mm256_extracti128_si256(q8, 1);
+                __m128i h0 = _mm_madd_epi16(_mm_maddubs_epi16(ones8, qlo), ones16_128);
+                __m128i h1 = _mm_madd_epi16(_mm_maddubs_epi16(ones8, qhi), ones16_128);
+                __m128i ht = _mm_add_epi32(h0, h1);
+                ht = _mm_hadd_epi32(ht, ht);
+                ht = _mm_hadd_epi32(ht, ht);
+                sum_q += _mm_cvtsi128_si32(ht);
+            }
+            out_b->bias = -8.0f * d * (float)sum_q;
+            continue;
+        }
+#endif
+        (void)use_avx2;
+        float amax = 0.0f;
+        for (int l = 0; l < avail; ++l) {
+            float av = fabsf(vec[base + l]);
+            if (av > amax) amax = av;
+        }
+        float d = amax / 127.0f;
+        float id = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+        out_b->d = d;
+        int32_t sum_q = 0;
+        for (int l = 0; l < avail; ++l) {
+            int q = (int)lrintf(vec[base + l] * id);
+            if (q > 127) q = 127;
+            else if (q < -127) q = -127;
+            out_b->qs[l] = (int8_t)q;
+            sum_q += q;
+        }
+        for (int l = avail; l < Q4_REPACK_GROUP_SIZE; ++l) {
+            out_b->qs[l] = 0;
+        }
+        out_b->bias = -8.0f * d * (float)sum_q;
+    }
+}
+
+static inline void quantize_vec_q8_64(LilaQ8_64Block *dst, const float *vec, int cols) {
+    quantize_vec_q8_64_strided(dst, 1, vec, cols);
+}
+
+static inline float q4_repack_dot_q8_64_scalar(const uint8_t *row_ptr, const LilaQ8_64Block *qx, int n_blk) {
+    float acc = 0.0f;
+    for (int b = 0; b < n_blk; ++b) {
+        const uint8_t *blk = row_ptr + (size_t)b * Q4_REPACK_BLOCK_SIZE;
+        uint16_t d_raw;
+        memcpy(&d_raw, blk, 2);
+        float sw = fp16_to_fp32(d_raw);
+        const uint8_t *qs = blk + 2;
+        const LilaQ8_64Block *xb = &qx[b];
+        int32_t sumi = 0;
+        for (int l = 0; l < 32; ++l) {
+            uint8_t byte = qs[l];
+            sumi += (int32_t)(byte & 0x0Fu) * (int32_t)xb->qs[l];
+            sumi += (int32_t)(byte >> 4)    * (int32_t)xb->qs[l + 32];
+        }
+        acc += (float)sumi * (sw * xb->d) + sw * xb->bias;
+    }
+    return acc;
+}
+
+static inline float q4_repack_dot_q8_64_simd(const uint8_t *row_ptr, const LilaQ8_64Block *qx, int n_blk) {
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    if (asi_cpu_has_avx2_fma_f16c()) {
+        const __m256i mask_lo = _mm256_set1_epi8(0x0F);
+        const __m256i ones16 = _mm256_set1_epi16(1);
+        __m256 acc = _mm256_setzero_ps();
+        float bias = 0.0f;
+        for (int b = 0; b < n_blk; ++b) {
+            const uint8_t *blk = row_ptr + (size_t)b * Q4_REPACK_BLOCK_SIZE;
+            uint16_t d_raw;
+            memcpy(&d_raw, blk, 2);
+            float sw = _cvtsh_ss(d_raw);
+            const LilaQ8_64Block *xb = &qx[b];
+            __m256i wb = _mm256_loadu_si256((const __m256i *)(blk + 2));
+            __m256i x_lo = _mm256_load_si256((const __m256i *)(xb->qs + 0));
+            __m256i x_hi = _mm256_load_si256((const __m256i *)(xb->qs + 32));
+            __m256i p = _mm256_add_epi32(
+                _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_and_si256(wb, mask_lo), x_lo), ones16),
+                _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_and_si256(_mm256_srli_epi16(wb, 4), mask_lo), x_hi), ones16));
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(sw * xb->d), acc);
+            bias += sw * xb->bias;
+        }
+        return lila_hsum_f32_avx2(acc) + bias;
+    }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+    const uint8x16_t mask_lo = vdupq_n_u8(0x0F);
+    float total = 0.0f;
+    for (int b = 0; b < n_blk; ++b) {
+        const uint8_t *blk = row_ptr + (size_t)b * Q4_REPACK_BLOCK_SIZE;
+        uint16_t d_raw;
+        memcpy(&d_raw, blk, 2);
+        float sw = fp16_to_fp32(d_raw);
+        const uint8_t *qs = blk + 2;
+        const LilaQ8_64Block *xb = &qx[b];
+        int32x4_t acc = vdupq_n_s32(0);
+        for (int c = 0; c < 2; ++c) {
+            uint8x16_t wb = vld1q_u8(qs + c * 16);
+            int8x16_t w_lo = vreinterpretq_s8_u8(vandq_u8(wb, mask_lo));
+            int8x16_t w_hi = vreinterpretq_s8_u8(vshrq_n_u8(wb, 4));
+            int8x16_t x_lo = vld1q_s8(xb->qs + c * 16);
+            int8x16_t x_hi = vld1q_s8(xb->qs + 32 + c * 16);
+#  if defined(__ARM_FEATURE_DOTPROD)
+            acc = vdotq_s32(acc, w_lo, x_lo);
+            acc = vdotq_s32(acc, w_hi, x_hi);
+#  else
+            acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(w_lo), vget_low_s8(x_lo)));
+            acc = vpadalq_s16(acc, vmull_s8(vget_high_s8(w_lo), vget_high_s8(x_lo)));
+            acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(w_hi), vget_low_s8(x_hi)));
+            acc = vpadalq_s16(acc, vmull_s8(vget_high_s8(w_hi), vget_high_s8(x_hi)));
+#  endif
+        }
+#  if defined(__aarch64__)
+        int32_t sumi = vaddvq_s32(acc);
+#  else
+        int32x2_t s2 = vadd_s32(vget_low_s32(acc), vget_high_s32(acc));
+        int32_t sumi = vget_lane_s32(vpadd_s32(s2, s2), 0);
+#  endif
+        total += (float)sumi * (sw * xb->d) + sw * xb->bias;
+    }
+    return total;
+#endif
+    return q4_repack_dot_q8_64_scalar(row_ptr, qx, n_blk);
+}
+
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+static inline void q4_repack_dot2_q8_64_avx2(const uint8_t *r0, const uint8_t *r1,
+                                             const LilaQ8_64Block *qx, int n_blk,
+                                             float *out0, float *out1) {
+    const __m256i mask_lo = _mm256_set1_epi8(0x0F);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    __m256 a0 = _mm256_setzero_ps();
+    __m256 a1 = _mm256_setzero_ps();
+    float b0 = 0.0f, b1 = 0.0f;
+    for (int b = 0; b < n_blk; ++b) {
+        const uint8_t *blk0 = r0 + (size_t)b * Q4_REPACK_BLOCK_SIZE;
+        const uint8_t *blk1 = r1 + (size_t)b * Q4_REPACK_BLOCK_SIZE;
+        uint16_t d0_raw, d1_raw;
+        memcpy(&d0_raw, blk0, 2);
+        memcpy(&d1_raw, blk1, 2);
+        float sw0 = _cvtsh_ss(d0_raw);
+        float sw1 = _cvtsh_ss(d1_raw);
+        const LilaQ8_64Block *xb = &qx[b];
+        __m256i x_lo = _mm256_load_si256((const __m256i *)(xb->qs + 0));
+        __m256i x_hi = _mm256_load_si256((const __m256i *)(xb->qs + 32));
+        __m256i wb0  = _mm256_loadu_si256((const __m256i *)(blk0 + 2));
+        __m256i wb1  = _mm256_loadu_si256((const __m256i *)(blk1 + 2));
+
+        __m256i p0 = _mm256_add_epi32(
+            _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_and_si256(wb0, mask_lo), x_lo), ones16),
+            _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_and_si256(_mm256_srli_epi16(wb0, 4), mask_lo), x_hi), ones16));
+        __m256i p1 = _mm256_add_epi32(
+            _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_and_si256(wb1, mask_lo), x_lo), ones16),
+            _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_and_si256(_mm256_srli_epi16(wb1, 4), mask_lo), x_hi), ones16));
+
+        a0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p0), _mm256_set1_ps(sw0 * xb->d), a0);
+        a1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p1), _mm256_set1_ps(sw1 * xb->d), a1);
+        b0 += sw0 * xb->bias;
+        b1 += sw1 * xb->bias;
+    }
+    *out0 = lila_hsum_f32_avx2(a0) + b0;
+    *out1 = lila_hsum_f32_avx2(a1) + b1;
+}
+
+/*
+ * Register-safe fused multi-token GEMV for Q4_REPACK (hard-capped at B <= 3).
+ * Uses <= 11 YMM registers so Broadwell 16-YMM targets never spill to stack.
+ * Note: qx_all is strided by qx_stride across blocks: qx_all[blk * qx_stride + (t0 + k)].
+ */
+static inline void q4_repack_dot_1xB_q8_avx2(const uint8_t *row_ptr,
+                                             const LilaQ8_64Block *qx_all,
+                                             int qx_stride,
+                                             int t0,
+                                             int k_cnt,
+                                             int n_blk,
+                                             float * const out_ptrs[3],
+                                             int row_idx) {
+    const __m256i mask_lo = _mm256_set1_epi8(0x0F);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    __m256 a0 = _mm256_setzero_ps();
+    __m256 a1 = _mm256_setzero_ps();
+    __m256 a2 = _mm256_setzero_ps();
+    float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f;
+
+    for (int b = 0; b < n_blk; ++b) {
+        const uint8_t *blk = row_ptr + (size_t)b * Q4_REPACK_BLOCK_SIZE;
+        uint16_t d_raw;
+        memcpy(&d_raw, blk, 2);
+        float sw = _cvtsh_ss(d_raw);
+        __m256i wb = _mm256_loadu_si256((const __m256i *)(blk + 2));
+        __m256i w_lo = _mm256_and_si256(wb, mask_lo);
+        __m256i w_hi = _mm256_and_si256(_mm256_srli_epi16(wb, 4), mask_lo);
+        const LilaQ8_64Block *xb = qx_all + (size_t)b * (size_t)qx_stride + (size_t)t0;
+
+        {
+            __m256i p0 = _mm256_add_epi32(
+                _mm256_madd_epi16(_mm256_maddubs_epi16(w_lo, _mm256_load_si256((const __m256i *)(xb[0].qs + 0))), ones16),
+                _mm256_madd_epi16(_mm256_maddubs_epi16(w_hi, _mm256_load_si256((const __m256i *)(xb[0].qs + 32))), ones16));
+            a0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p0), _mm256_set1_ps(sw * xb[0].d), a0);
+            b0 += sw * xb[0].bias;
+        }
+        if (k_cnt >= 2) {
+            __m256i p1 = _mm256_add_epi32(
+                _mm256_madd_epi16(_mm256_maddubs_epi16(w_lo, _mm256_load_si256((const __m256i *)(xb[1].qs + 0))), ones16),
+                _mm256_madd_epi16(_mm256_maddubs_epi16(w_hi, _mm256_load_si256((const __m256i *)(xb[1].qs + 32))), ones16));
+            a1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p1), _mm256_set1_ps(sw * xb[1].d), a1);
+            b1 += sw * xb[1].bias;
+        }
+        if (k_cnt >= 3) {
+            __m256i p2 = _mm256_add_epi32(
+                _mm256_madd_epi16(_mm256_maddubs_epi16(w_lo, _mm256_load_si256((const __m256i *)(xb[2].qs + 0))), ones16),
+                _mm256_madd_epi16(_mm256_maddubs_epi16(w_hi, _mm256_load_si256((const __m256i *)(xb[2].qs + 32))), ones16));
+            a2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p2), _mm256_set1_ps(sw * xb[2].d), a2);
+            b2 += sw * xb[2].bias;
+        }
+    }
+    if (out_ptrs[0]) out_ptrs[0][row_idx] = lila_hsum_f32_avx2(a0) + b0;
+    if (k_cnt >= 2 && out_ptrs[1]) out_ptrs[1][row_idx] = lila_hsum_f32_avx2(a1) + b1;
+    if (k_cnt >= 3 && out_ptrs[2]) out_ptrs[2][row_idx] = lila_hsum_f32_avx2(a2) + b2;
+}
+#endif
+
+static inline void q4_repack_matvec_range(float *out, const uint8_t *w, const LilaQ8_64Block *qx,
+                                          int start, int end, int n_blk) {
+    size_t rb = (size_t)n_blk * Q4_REPACK_BLOCK_SIZE;
+    int i = start;
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    if (asi_cpu_has_avx2_fma_f16c()) {
+        for (; i + 1 < end; i += 2) {
+            const uint8_t *rp = w + (size_t)i * rb;
+            if (i + 3 < end) {
+                LILA_PREFETCH(rp + 2 * rb);
+                LILA_PREFETCH(rp + 3 * rb);
+            }
+            q4_repack_dot2_q8_64_avx2(rp, rp + rb, qx, n_blk, &out[i], &out[i + 1]);
+        }
+    }
+#endif
+    for (; i < end; ++i) {
+        const uint8_t *rp = w + (size_t)i * rb;
+        if (i + 2 < end) LILA_PREFETCH(rp + 2 * rb);
+        out[i] = q4_repack_dot_q8_64_simd(rp, qx, n_blk);
+    }
+}
+
+static inline void q4_repack_matmul_batch_q8_range(float *out, const uint8_t *w,
+                                                   const LilaQ8_64Block *qx_all,
+                                                   int n_tokens, int row_start, int row_end,
+                                                   int total_rows, int n_blk) {
+    size_t rb = (size_t)n_blk * Q4_REPACK_BLOCK_SIZE;
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    if (asi_cpu_has_avx2_fma_f16c()) {
+        /* Hard-cap register pass at ASI_SPEC_MAX_BATCH_16YMM (=3), avoiding B=4 YMM spills */
+        for (int t0 = 0; t0 < n_tokens; ) {
+            int rem = n_tokens - t0;
+            int k_cnt = (rem == 4) ? 2 : ((rem >= ASI_SPEC_MAX_BATCH_16YMM) ? ASI_SPEC_MAX_BATCH_16YMM : rem);
+            float *out_ptrs[3] = {
+                out + (size_t)(t0 + 0) * (size_t)total_rows,
+                (k_cnt >= 2) ? (out + (size_t)(t0 + 1) * (size_t)total_rows) : NULL,
+                (k_cnt >= 3) ? (out + (size_t)(t0 + 2) * (size_t)total_rows) : NULL
+            };
+            for (int i = row_start; i < row_end; ++i) {
+                const uint8_t *rp = w + (size_t)i * rb;
+                if (i + 2 < row_end) LILA_PREFETCH(rp + 2 * rb);
+                q4_repack_dot_1xB_q8_avx2(rp, qx_all, n_tokens, t0, k_cnt, n_blk, out_ptrs, i);
+            }
+            t0 += k_cnt;
+        }
+        return;
+    }
+#endif
+    for (int i = row_start; i < row_end; ++i) {
+        const uint8_t *rp = w + (size_t)i * rb;
+        if (i + 2 < row_end) LILA_PREFETCH(rp + 2 * rb);
+        for (int t = 0; t < n_tokens; ++t) {
+            float acc = 0.0f;
+            for (int b = 0; b < n_blk; ++b) {
+                acc += q4_repack_dot_q8_64_simd(rp + (size_t)b * Q4_REPACK_BLOCK_SIZE,
+                                                qx_all + (size_t)b * (size_t)n_tokens + (size_t)t, 1);
+            }
+            out[(size_t)t * (size_t)total_rows + (size_t)i] = acc;
+        }
+    }
+}
+
+static inline void q4_repack_matmul_batch_q8_split_range(float *out0, float *out_rest,
+                                                         const uint8_t *w,
+                                                         const LilaQ8_64Block *qx_all,
+                                                         int n_tokens, int row_start, int row_end,
+                                                         int total_rows, int n_blk) {
+    size_t rb = (size_t)n_blk * Q4_REPACK_BLOCK_SIZE;
+    float *all_ptrs[4] = {
+        out0,
+        (n_tokens > 1 && out_rest) ? (out_rest + (size_t)0 * (size_t)total_rows) : NULL,
+        (n_tokens > 2 && out_rest) ? (out_rest + (size_t)1 * (size_t)total_rows) : NULL,
+        (n_tokens > 3 && out_rest) ? (out_rest + (size_t)2 * (size_t)total_rows) : NULL
+    };
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    if (asi_cpu_has_avx2_fma_f16c() && n_tokens >= 1 && n_tokens <= 4) {
+        for (int t0 = 0; t0 < n_tokens; ) {
+            int rem = n_tokens - t0;
+            int k_cnt = (rem == 4) ? 2 : ((rem >= ASI_SPEC_MAX_BATCH_16YMM) ? ASI_SPEC_MAX_BATCH_16YMM : rem);
+            float *ptrs[3] = {
+                all_ptrs[t0 + 0],
+                (k_cnt >= 2) ? all_ptrs[t0 + 1] : NULL,
+                (k_cnt >= 3) ? all_ptrs[t0 + 2] : NULL
+            };
+            for (int i = row_start; i < row_end; ++i) {
+                const uint8_t *rp = w + (size_t)i * rb;
+                if (i + 2 < row_end) LILA_PREFETCH(rp + 2 * rb);
+                q4_repack_dot_1xB_q8_avx2(rp, qx_all, n_tokens, t0, k_cnt, n_blk, ptrs, i);
+            }
+            t0 += k_cnt;
+        }
+        return;
+    }
+#endif
+    for (int i = row_start; i < row_end; ++i) {
+        const uint8_t *rp = w + (size_t)i * rb;
+        for (int t = 0; t < n_tokens && t < 4; ++t) {
+            float acc = 0.0f;
+            for (int b = 0; b < n_blk; ++b) {
+                acc += q4_repack_dot_q8_64_simd(rp + (size_t)b * Q4_REPACK_BLOCK_SIZE,
+                                                qx_all + (size_t)b * (size_t)n_tokens + (size_t)t, 1);
+            }
+            if (all_ptrs[t]) all_ptrs[t][i] = acc;
+        }
+    }
+}
+
+/*
+ * Fast IEEE-754 bit-bucket column selector for sparse post-activation matvec
+ * (E07 Exp 2C: safe post-multiply SiLU(gate)*up pruning on col-major Q4_REPACK).
+ * Selects up to ceil(cols * keep_frac) largest-magnitude non-zero inputs in O(cols).
+ */
+static inline int asi_select_topk_abs_cols(const float *in, int cols, float keep_frac,
+                                           uint32_t *out_active, int max_active) {
+    if (!in || !out_active || cols <= 0 || max_active <= 0) return 0;
+    if (keep_frac <= 0.0f) return 0;
+    int target_k = (int)(ceilf((double)cols * (double)keep_frac));
+    if (target_k < 1) target_k = 1;
+    if (target_k > cols) target_k = cols;
+    if (target_k > max_active) target_k = max_active;
+
+    int hist[512];
+    memset(hist, 0, sizeof(hist));
+    int nz_total = 0;
+    for (int c = 0; c < cols; ++c) {
+        uint32_t u = 0;
+        memcpy(&u, in + c, 4);
+        u &= 0x7FFFFFFFu;
+        if (u == 0u) continue;
+        int b = (int)(u >> 22);
+        if (b > 511) b = 511;
+        hist[b]++;
+        nz_total++;
+    }
+    if (nz_total == 0) return 0;
+    if (nz_total <= target_k) {
+        int n = 0;
+        for (int c = 0; c < cols && n < target_k; ++c) {
+            uint32_t u = 0;
+            memcpy(&u, in + c, 4);
+            if ((u & 0x7FFFFFFFu) != 0u) out_active[n++] = (uint32_t)c;
+        }
+        return n;
+    }
+
+    int cum = 0;
+    int tb = 511;
+    for (; tb > 0; --tb) {
+        if (cum + hist[tb] >= target_k) break;
+        cum += hist[tb];
+    }
+    int strict_rem = target_k - cum;
+    int eq_budget = (strict_rem > 0) ? strict_rem : 0;
+    int n = 0;
+    for (int c = 0; c < cols && n < target_k; ++c) {
+        uint32_t u = 0;
+        memcpy(&u, in + c, 4);
+        u &= 0x7FFFFFFFu;
+        if (u == 0u) continue;
+        int b = (int)(u >> 22);
+        if (b > 511) b = 511;
+        if (b > tb) {
+            out_active[n++] = (uint32_t)c;
+        } else if (b == tb && eq_budget > 0) {
+            out_active[n++] = (uint32_t)c;
+            eq_budget--;
+        }
+    }
+    return n;
+}
+
+/*
+ * Column-major ASI_QUANT_Q4_REPACK matrix-vector multiply over rows [row_start, row_end).
+ * Storage layout per column c: n_row_blk blocks of 64 consecutive rows (2B fp16 scale + 32B nibbles).
+ * If active_cols != NULL, accumulates only over active_cols[0..n_active-1].
+ */
+static inline void q4_repack_col_major_matvec_range(float *out,
+                                                    const uint8_t *w,
+                                                    const float *in,
+                                                    int row_start,
+                                                    int row_end,
+                                                    int total_rows,
+                                                    int cols,
+                                                    const uint32_t *active_cols,
+                                                    int n_active) {
+    if (!out || !w || !in || row_start >= row_end || cols <= 0 || total_rows <= 0) return;
+    for (int r = row_start; r < row_end; ++r) out[r] = 0.0f;
+
+    int k_count = active_cols ? n_active : cols;
+    if (k_count <= 0) return;
+
+    int n_row_blk = (total_rows + Q4_REPACK_GROUP_SIZE - 1) / Q4_REPACK_GROUP_SIZE;
+    size_t col_bytes = (size_t)n_row_blk * Q4_REPACK_BLOCK_SIZE;
+    int rb_start = row_start / Q4_REPACK_GROUP_SIZE;
+    int rb_end   = (row_end - 1) / Q4_REPACK_GROUP_SIZE;
+
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    const __m256i m0f = _mm256_set1_epi8(0x0F);
+    const __m256i v8  = _mm256_set1_epi32(8);
+#elif defined(__ARM_NEON)
+    const uint8x16_t m0f_n = vdupq_n_u8(0x0F);
+    const int32x4_t v8_n   = vdupq_n_s32(8);
+#endif
+
+    for (int rb = rb_start; rb <= rb_end; ++rb) {
+        int r0 = rb * Q4_REPACK_GROUP_SIZE;
+        int full_blk = (r0 >= row_start && r0 + Q4_REPACK_GROUP_SIZE <= row_end);
+        size_t blk_off = (size_t)rb * Q4_REPACK_BLOCK_SIZE;
+
+        if (full_blk) {
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+            __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+            __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+            __m256 a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps();
+            __m256 a6 = _mm256_setzero_ps(), a7 = _mm256_setzero_ps();
+            for (int ki = 0; ki < k_count; ++ki) {
+                int c = active_cols ? (int)active_cols[ki] : ki;
+                float xv = in[c];
+                if (xv == 0.0f) continue;
+                const uint8_t *bp = w + (size_t)c * col_bytes + blk_off;
+                uint16_t d_raw;
+                memcpy(&d_raw, bp, 2);
+                __m256 sv = _mm256_set1_ps(_cvtsh_ss(d_raw) * xv);
+                __m256i q = _mm256_loadu_si256((const __m256i *)(bp + 2));
+                __m256i qlo = _mm256_and_si256(q, m0f);
+                __m256i qhi = _mm256_and_si256(_mm256_srli_epi16(q, 4), m0f);
+                __m128i lo0 = _mm256_castsi256_si128(qlo);
+                __m128i lo1 = _mm256_extracti128_si256(qlo, 1);
+                __m128i hi0 = _mm256_castsi256_si128(qhi);
+                __m128i hi1 = _mm256_extracti128_si256(qhi, 1);
+                a0 = _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(lo0), v8)), a0);
+                a1 = _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(lo0, 8)), v8)), a1);
+                a2 = _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(lo1), v8)), a2);
+                a3 = _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(lo1, 8)), v8)), a3);
+                a4 = _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(hi0), v8)), a4);
+                a5 = _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(hi0, 8)), v8)), a5);
+                a6 = _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(hi1), v8)), a6);
+                a7 = _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(hi1, 8)), v8)), a7);
+            }
+            _mm256_storeu_ps(out + r0 +  0, a0); _mm256_storeu_ps(out + r0 +  8, a1);
+            _mm256_storeu_ps(out + r0 + 16, a2); _mm256_storeu_ps(out + r0 + 24, a3);
+            _mm256_storeu_ps(out + r0 + 32, a4); _mm256_storeu_ps(out + r0 + 40, a5);
+            _mm256_storeu_ps(out + r0 + 48, a6); _mm256_storeu_ps(out + r0 + 56, a7);
+#elif defined(__ARM_NEON)
+            float32x4_t acc[16];
+            for (int v = 0; v < 16; ++v) acc[v] = vdupq_n_f32(0.0f);
+            for (int ki = 0; ki < k_count; ++ki) {
+                int c = active_cols ? (int)active_cols[ki] : ki;
+                float xv = in[c];
+                if (xv == 0.0f) continue;
+                const uint8_t *bp = w + (size_t)c * col_bytes + blk_off;
+                uint16_t d_raw;
+                memcpy(&d_raw, bp, 2);
+                float32x4_t sv = vdupq_n_f32(fp16_to_fp32(d_raw) * xv);
+                for (int h = 0; h < 2; ++h) {
+                    uint8x16_t q = vld1q_u8(bp + 2 + h * 16);
+                    uint8x16_t qlo = vandq_u8(q, m0f_n);
+                    uint8x16_t qhi = vshrq_n_u8(q, 4);
+                    uint16x8_t lo16_0 = vmovl_u8(vget_low_u8(qlo));
+                    uint16x8_t lo16_1 = vmovl_u8(vget_high_u8(qlo));
+                    uint16x8_t hi16_0 = vmovl_u8(vget_low_u8(qhi));
+                    uint16x8_t hi16_1 = vmovl_u8(vget_high_u8(qhi));
+                    int ob_lo = h * 4;
+                    int ob_hi = 8 + h * 4;
+                    acc[ob_lo + 0] = vmlaq_f32(acc[ob_lo + 0], sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(lo16_0))),  v8_n)));
+                    acc[ob_lo + 1] = vmlaq_f32(acc[ob_lo + 1], sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(lo16_0))), v8_n)));
+                    acc[ob_lo + 2] = vmlaq_f32(acc[ob_lo + 2], sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(lo16_1))),  v8_n)));
+                    acc[ob_lo + 3] = vmlaq_f32(acc[ob_lo + 3], sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(lo16_1))), v8_n)));
+                    acc[ob_hi + 0] = vmlaq_f32(acc[ob_hi + 0], sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(hi16_0))),  v8_n)));
+                    acc[ob_hi + 1] = vmlaq_f32(acc[ob_hi + 1], sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(hi16_0))), v8_n)));
+                    acc[ob_hi + 2] = vmlaq_f32(acc[ob_hi + 2], sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(hi16_1))),  v8_n)));
+                    acc[ob_hi + 3] = vmlaq_f32(acc[ob_hi + 3], sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(hi16_1))), v8_n)));
+                }
+            }
+            for (int v = 0; v < 16; ++v) vst1q_f32(out + r0 + v * 4, acc[v]);
+#else
+            float acc[Q4_REPACK_GROUP_SIZE];
+            memset(acc, 0, sizeof(acc));
+            for (int ki = 0; ki < k_count; ++ki) {
+                int c = active_cols ? (int)active_cols[ki] : ki;
+                float xv = in[c];
+                if (xv == 0.0f) continue;
+                const uint8_t *bp = w + (size_t)c * col_bytes + blk_off;
+                uint16_t d_raw;
+                memcpy(&d_raw, bp, 2);
+                float sv = fp16_to_fp32(d_raw) * xv;
+                const uint8_t *qs = bp + 2;
+                for (int l = 0; l < 32; ++l) {
+                    acc[l]      += sv * (float)((int)(qs[l] & 0x0Fu) - 8);
+                    acc[l + 32] += sv * (float)((int)(qs[l] >> 4) - 8);
+                }
+            }
+            memcpy(out + r0, acc, sizeof(acc));
+#endif
+        } else {
+            float acc[Q4_REPACK_GROUP_SIZE];
+            memset(acc, 0, sizeof(acc));
+            for (int ki = 0; ki < k_count; ++ki) {
+                int c = active_cols ? (int)active_cols[ki] : ki;
+                float xv = in[c];
+                if (xv == 0.0f) continue;
+                const uint8_t *bp = w + (size_t)c * col_bytes + blk_off;
+                uint16_t d_raw;
+                memcpy(&d_raw, bp, 2);
+                float sv = fp16_to_fp32(d_raw) * xv;
+                const uint8_t *qs = bp + 2;
+                for (int l = 0; l < 32; ++l) {
+                    acc[l]      += sv * (float)((int)(qs[l] & 0x0Fu) - 8);
+                    acc[l + 32] += sv * (float)((int)(qs[l] >> 4) - 8);
+                }
+            }
+            int c_lo = (row_start > r0) ? row_start : r0;
+            int c_hi = (row_end < r0 + Q4_REPACK_GROUP_SIZE) ? row_end : (r0 + Q4_REPACK_GROUP_SIZE);
+            for (int r = c_lo; r < c_hi; ++r) out[r] = acc[r - r0];
+        }
+    }
+}
+
+/* 3-bit Split-Plane vpshufb LUT kernels */
+static inline void q3_splitlut_build_lut(LilaQ3LutBlock *luts, const float *x, int cols) {
+    static const float qh[4] = {-3.0f, -1.0f, 1.0f, 3.0f};
+    int n_blk128 = (cols + Q3_SPLITLUT_BLK_COLS - 1) / Q3_SPLITLUT_BLK_COLS;
+    for (int blk = 0; blk < n_blk128; ++blk) {
+        float xb[128];
+        int base = blk * 128;
+        int avail = cols - base;
+        if (avail >= 128) {
+            memcpy(xb, x + base, 128 * sizeof(float));
+        } else {
+            memcpy(xb, x + base, (size_t)avail * sizeof(float));
+            memset(xb + avail, 0, (size_t)(128 - avail) * sizeof(float));
+        }
+        float mh = 1e-12f, ml = 1e-12f;
+        for (int g = 0; g < 64; ++g) {
+            float m = 3.0f * (fabsf(xb[g * 2 + 0]) + fabsf(xb[g * 2 + 1]));
+            if (m > mh) mh = m;
+        }
+        for (int g = 0; g < 32; ++g) {
+            float m = 0.5f * (fabsf(xb[g * 4 + 0]) + fabsf(xb[g * 4 + 1]) +
+                              fabsf(xb[g * 4 + 2]) + fabsf(xb[g * 4 + 3]));
+            if (m > ml) ml = m;
+        }
+        LilaQ3LutBlock *lb = &luts[blk];
+        lb->xs_hi2 = mh / 127.0f;
+        lb->xs_lo1 = ml / 127.0f;
+        float invh = 1.0f / lb->xs_hi2;
+        float invl = 1.0f / lb->xs_lo1;
+        for (int g = 0; g < 64; ++g) {
+            float x0 = xb[g * 2 + 0], x1 = xb[g * 2 + 1];
+            for (int idx = 0; idx < 16; ++idx) {
+                int iv = (int)lrintf((qh[idx & 3] * x0 + qh[(idx >> 2) & 3] * x1) * invh);
+                if (iv > 127) iv = 127;
+                if (iv < -127) iv = -127;
+                lb->lut_hi2[g][idx] = (int8_t)iv;
+            }
+        }
+        for (int g = 0; g < 32; ++g) {
+            float x0 = xb[g * 4 + 0], x1 = xb[g * 4 + 1];
+            float x2 = xb[g * 4 + 2], x3 = xb[g * 4 + 3];
+            for (int idx = 0; idx < 16; ++idx) {
+                float v = ((idx & 1) ? 0.5f : -0.5f) * x0 + ((idx & 2) ? 0.5f : -0.5f) * x1 +
+                          ((idx & 4) ? 0.5f : -0.5f) * x2 + ((idx & 8) ? 0.5f : -0.5f) * x3;
+                int iv = (int)lrintf(v * invl);
+                if (iv > 127) iv = 127;
+                if (iv < -127) iv = -127;
+                lb->lut_lo1[g][idx] = (int8_t)iv;
+            }
+        }
+    }
+}
+
+static inline void q3_splitlut_tile_scalar(const uint8_t *tile_ptr, int n_blk128,
+                                           const LilaQ3LutBlock *luts, int valid_rows,
+                                           float *out_rows) {
+    float f[64];
+    for (int lr = 0; lr < valid_rows; ++lr) f[lr] = 0.0f;
+    for (int blk = 0; blk < n_blk128; ++blk) {
+        const uint8_t *bp_h = tile_ptr + (size_t)blk * Q3_SPLITLUT_BLK_BYTES;
+        const uint8_t *bp_l = bp_h + Q3_SPLITLUT_BLK_HI2_BYTES;
+        const uint16_t *sp  = (const uint16_t *)(bp_l + Q3_SPLITLUT_BLK_LO1_BYTES);
+        const LilaQ3LutBlock *lb = &luts[blk];
+        int32_t ah[64] = {0}, al[64] = {0};
+        for (int g = 0; g < 64; ++g) {
+            const uint8_t *gp = bp_h + (size_t)g * 32u;
+            const int8_t *lut = lb->lut_hi2[g];
+            for (int lr = 0; lr < valid_rows; ++lr) {
+                uint8_t byte = gp[lr & 31];
+                uint8_t nib = (lr >= 32) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0x0Fu);
+                ah[lr] += (int32_t)lut[nib];
+            }
+        }
+        for (int g = 0; g < 32; ++g) {
+            const uint8_t *gp = bp_l + (size_t)g * 32u;
+            const int8_t *lut = lb->lut_lo1[g];
+            for (int lr = 0; lr < valid_rows; ++lr) {
+                uint8_t byte = gp[lr & 31];
+                uint8_t nib = (lr >= 32) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0x0Fu);
+                al[lr] += (int32_t)lut[nib];
+            }
+        }
+        for (int lr = 0; lr < valid_rows; ++lr) {
+            uint16_t sc_raw;
+            memcpy(&sc_raw, sp + lr, 2);
+            float ws = fp16_to_fp32(sc_raw);
+            float tot = (float)ah[lr] * lb->xs_hi2 + (float)al[lr] * lb->xs_lo1;
+            f[lr] += tot * ws;
+        }
+    }
+    for (int lr = 0; lr < valid_rows; ++lr) out_rows[lr] = f[lr];
+}
+
+static inline void q3_splitlut_tile_simd(const uint8_t *tile_ptr, int n_blk128,
+                                         const LilaQ3LutBlock *luts, int valid_rows,
+                                         float *out_rows) {
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    if (asi_cpu_has_avx2_fma_f16c()) {
+        const __m256i mask_lo = _mm256_set1_epi8(0x0F);
+        __m256 f0 = _mm256_setzero_ps(), f1 = _mm256_setzero_ps();
+        __m256 f2 = _mm256_setzero_ps(), f3 = _mm256_setzero_ps();
+        __m256 f4 = _mm256_setzero_ps(), f5 = _mm256_setzero_ps();
+        __m256 f6 = _mm256_setzero_ps(), f7 = _mm256_setzero_ps();
+        for (int blk = 0; blk < n_blk128; ++blk) {
+            const uint8_t *bp_h = tile_ptr + (size_t)blk * Q3_SPLITLUT_BLK_BYTES;
+            const uint8_t *bp_l = bp_h + Q3_SPLITLUT_BLK_HI2_BYTES;
+            const uint16_t *sp  = (const uint16_t *)(bp_l + Q3_SPLITLUT_BLK_LO1_BYTES);
+            const LilaQ3LutBlock *lb = &luts[blk];
+
+            __m256i ah0 = _mm256_setzero_si256(), ah1 = _mm256_setzero_si256();
+            __m256i ah2 = _mm256_setzero_si256(), ah3 = _mm256_setzero_si256();
+            for (int g = 0; g < 64; ++g) {
+                __m256i lut = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)lb->lut_hi2[g]));
+                __m256i w = _mm256_loadu_si256((const __m256i *)(bp_h + (size_t)g * 32u));
+                __m256i vl = _mm256_shuffle_epi8(lut, _mm256_and_si256(w, mask_lo));
+                __m256i vh = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(w, 4), mask_lo));
+                ah0 = _mm256_add_epi16(ah0, _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vl)));
+                ah1 = _mm256_add_epi16(ah1, _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vl, 1)));
+                ah2 = _mm256_add_epi16(ah2, _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vh)));
+                ah3 = _mm256_add_epi16(ah3, _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vh, 1)));
+            }
+
+            __m256i al0 = _mm256_setzero_si256(), al1 = _mm256_setzero_si256();
+            __m256i al2 = _mm256_setzero_si256(), al3 = _mm256_setzero_si256();
+            for (int g = 0; g < 32; ++g) {
+                __m256i lut = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)lb->lut_lo1[g]));
+                __m256i w = _mm256_loadu_si256((const __m256i *)(bp_l + (size_t)g * 32u));
+                __m256i vl = _mm256_shuffle_epi8(lut, _mm256_and_si256(w, mask_lo));
+                __m256i vh = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(w, 4), mask_lo));
+                al0 = _mm256_add_epi16(al0, _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vl)));
+                al1 = _mm256_add_epi16(al1, _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vl, 1)));
+                al2 = _mm256_add_epi16(al2, _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vh)));
+                al3 = _mm256_add_epi16(al3, _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vh, 1)));
+            }
+
+            __m256 vsh = _mm256_set1_ps(lb->xs_hi2);
+            __m256 vsl = _mm256_set1_ps(lb->xs_lo1);
+            #define LILA_Q3_ACC8(F, AH, AL, OFF) do { \
+                __m256 ws = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(sp + (OFF)))); \
+                __m256 tot = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(AH)), vsh, \
+                             _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(AL)), vsl)); \
+                (F) = _mm256_fmadd_ps(tot, ws, (F)); \
+            } while (0)
+            LILA_Q3_ACC8(f0, _mm256_castsi256_si128(ah0), _mm256_castsi256_si128(al0),  0);
+            LILA_Q3_ACC8(f1, _mm256_extracti128_si256(ah0, 1), _mm256_extracti128_si256(al0, 1),  8);
+            LILA_Q3_ACC8(f2, _mm256_castsi256_si128(ah1), _mm256_castsi256_si128(al1), 16);
+            LILA_Q3_ACC8(f3, _mm256_extracti128_si256(ah1, 1), _mm256_extracti128_si256(al1, 1), 24);
+            LILA_Q3_ACC8(f4, _mm256_castsi256_si128(ah2), _mm256_castsi256_si128(al2), 32);
+            LILA_Q3_ACC8(f5, _mm256_extracti128_si256(ah2, 1), _mm256_extracti128_si256(al2, 1), 40);
+            LILA_Q3_ACC8(f6, _mm256_castsi256_si128(ah3), _mm256_castsi256_si128(al3), 48);
+            LILA_Q3_ACC8(f7, _mm256_extracti128_si256(ah3, 1), _mm256_extracti128_si256(al3, 1), 56);
+            #undef LILA_Q3_ACC8
+        }
+        if (valid_rows == 64) {
+            _mm256_storeu_ps(out_rows +  0, f0); _mm256_storeu_ps(out_rows +  8, f1);
+            _mm256_storeu_ps(out_rows + 16, f2); _mm256_storeu_ps(out_rows + 24, f3);
+            _mm256_storeu_ps(out_rows + 32, f4); _mm256_storeu_ps(out_rows + 40, f5);
+            _mm256_storeu_ps(out_rows + 48, f6); _mm256_storeu_ps(out_rows + 56, f7);
+        } else {
+            _Alignas(32) float tmp[64];
+            _mm256_store_ps(tmp +  0, f0); _mm256_store_ps(tmp +  8, f1);
+            _mm256_store_ps(tmp + 16, f2); _mm256_store_ps(tmp + 24, f3);
+            _mm256_store_ps(tmp + 32, f4); _mm256_store_ps(tmp + 40, f5);
+            _mm256_store_ps(tmp + 48, f6); _mm256_store_ps(tmp + 56, f7);
+            memcpy(out_rows, tmp, (size_t)valid_rows * sizeof(float));
+        }
+        return;
+    }
+#endif
+    q3_splitlut_tile_scalar(tile_ptr, n_blk128, luts, valid_rows, out_rows);
+}
+
+static inline void q3_splitlut_matvec_range(float *out, const uint8_t *w, const LilaQ3LutBlock *luts,
+                                            int row_start, int row_end, int total_rows, int n_blk128) {
+    size_t tile_bytes = (size_t)n_blk128 * Q3_SPLITLUT_BLK_BYTES;
+    int t0 = row_start / Q3_SPLITLUT_TILE_ROWS;
+    int t1 = (row_end + Q3_SPLITLUT_TILE_ROWS - 1) / Q3_SPLITLUT_TILE_ROWS;
+    for (int tile = t0; tile < t1; ++tile) {
+        int r_base = tile * Q3_SPLITLUT_TILE_ROWS;
+        int valid = total_rows - r_base;
+        if (valid > Q3_SPLITLUT_TILE_ROWS) valid = Q3_SPLITLUT_TILE_ROWS;
+        const uint8_t *tp = w + (size_t)tile * tile_bytes;
+        if (tile + 1 < t1) LILA_PREFETCH(tp + tile_bytes);
+        if (r_base >= row_start && r_base + valid <= row_end) {
+            q3_splitlut_tile_simd(tp, n_blk128, luts, valid, out + r_base);
+        } else {
+            float tmp[Q3_SPLITLUT_TILE_ROWS];
+            q3_splitlut_tile_simd(tp, n_blk128, luts, valid, tmp);
+            int lo = (row_start > r_base) ? (row_start - r_base) : 0;
+            int hi = (row_end < r_base + valid) ? (row_end - r_base) : valid;
+            for (int lr = lo; lr < hi; ++lr) out[r_base + lr] = tmp[lr];
+        }
+    }
+}
+
 static inline size_t lila_quant_block_bytes(uint32_t quant_type, int is_repacked) {
     switch (quant_type) {
-        case 0u:  return 4u;
+        case 0u:   return 4u;
         case 1u:
-        case 30u: return 2u;
-        case 2u:  return Q4_0_BLOCK_SIZE;
-        case 8u:  return Q8_0_BLOCK_SIZE;
-        case 12u: return Q4_K_BLOCK_SIZE;
-        case 13u: return Q5_K_BLOCK_SIZE;
-        case 14u: return is_repacked ? sizeof(LilaQ6KRepackedBlock) : Q6_K_BLOCK_SIZE;
-        default:  return 0u;
+        case 30u:  return 2u;
+        case 2u:   return Q4_0_BLOCK_SIZE;
+        case 8u:   return Q8_0_BLOCK_SIZE;
+        case 12u:  return Q4_K_BLOCK_SIZE;
+        case 13u:  return Q5_K_BLOCK_SIZE;
+        case 14u:  return is_repacked ? sizeof(LilaQ6KRepackedBlock) : Q6_K_BLOCK_SIZE;
+        case 100u: return Q4_REPACK_BLOCK_SIZE;
+        case 101u: return 50u;
+        default:   return 0u;
     }
 }
 
 static inline size_t lila_quant_row_bytes(uint32_t quant_type, int cols, int is_repacked) {
     if (cols <= 0) return 0u;
     switch (quant_type) {
-        case 0u:  return (size_t)cols * 4u;
+        case 0u:   return (size_t)cols * 4u;
         case 1u:
-        case 30u: return (size_t)cols * 2u;
-        case 2u:  return ((size_t)(cols + 31) / 32u) * Q4_0_BLOCK_SIZE;
-        case 8u:  return ((size_t)(cols + 31) / 32u) * Q8_0_BLOCK_SIZE;
-        case 12u: return ((size_t)(cols + 255) / 256u) * Q4_K_BLOCK_SIZE;
-        case 13u: return ((size_t)(cols + 255) / 256u) * Q5_K_BLOCK_SIZE;
-        case 14u: return ((size_t)(cols + 255) / 256u) * (is_repacked ? sizeof(LilaQ6KRepackedBlock) : Q6_K_BLOCK_SIZE);
-        default:  return 0u;
+        case 30u:  return (size_t)cols * 2u;
+        case 2u:   return ((size_t)(cols + 31) / 32u) * Q4_0_BLOCK_SIZE;
+        case 8u:   return ((size_t)(cols + 31) / 32u) * Q8_0_BLOCK_SIZE;
+        case 12u:  return ((size_t)(cols + 255) / 256u) * Q4_K_BLOCK_SIZE;
+        case 13u:  return ((size_t)(cols + 255) / 256u) * Q5_K_BLOCK_SIZE;
+        case 14u:  return ((size_t)(cols + 255) / 256u) * (is_repacked ? sizeof(LilaQ6KRepackedBlock) : Q6_K_BLOCK_SIZE);
+        case 100u: return ((size_t)(cols + 63) / 64u) * Q4_REPACK_BLOCK_SIZE;
+        case 101u: return ((size_t)(cols + 127) / 128u) * 50u;
+        default:   return 0u;
     }
+}
+
+static inline size_t lila_quant_matrix_bytes(uint32_t quant_type, uint64_t cols, uint64_t rows,
+                                             int is_repacked, int is_col_major) {
+    if (cols == 0u || rows == 0u) return 0u;
+    if (quant_type == 101u) {
+        size_t n_tiles = (size_t)((rows + 63u) / 64u);
+        size_t n_blk128 = (size_t)((cols + 127u) / 128u);
+        return n_tiles * n_blk128 * Q3_SPLITLUT_BLK_BYTES;
+    }
+    if (is_col_major) {
+        size_t cb = lila_quant_row_bytes(quant_type, (int)rows, is_repacked);
+        return (size_t)cols * cb;
+    }
+    size_t rb = lila_quant_row_bytes(quant_type, (int)cols, is_repacked);
+    return (size_t)rows * rb;
 }
 
 static inline void lila_dequant_tensor_block(float *tmp, const uint8_t *block,
@@ -2582,6 +3504,8 @@ static inline void lila_dequant_tensor_block(float *tmp, const uint8_t *block,
         dequant_q4_0_block(tmp, block);
     } else if (quant_type == 8u) {
         dequant_q8_0_block(tmp, block);
+    } else if (quant_type == 100u) {
+        dequant_q4_repack_block(tmp, block);
     }
 }
 
@@ -2595,9 +3519,11 @@ static inline void lila_dequant_row(float *out, const uint8_t *row_ptr, int cols
     if (quant_type == 1u) {
         int i = 0;
 #if defined(__AVX2__) && defined(__F16C__)
-        for (; i + 7 < cols; i += 8) {
-            __m128i h = _mm_loadu_si128((const __m128i *)(row_ptr + (size_t)i * 2u));
-            _mm256_storeu_ps(out + i, _mm256_cvtph_ps(h));
+        if (asi_cpu_has_avx2_fma_f16c()) {
+            for (; i + 7 < cols; i += 8) {
+                __m128i h = _mm_loadu_si128((const __m128i *)(row_ptr + (size_t)i * 2u));
+                _mm256_storeu_ps(out + i, _mm256_cvtph_ps(h));
+            }
         }
 #endif
         for (; i < cols; ++i) {
@@ -2609,11 +3535,13 @@ static inline void lila_dequant_row(float *out, const uint8_t *row_ptr, int cols
     }
     if (quant_type == 30u) {
         int i = 0;
-#if defined(__AVX2__)
-        for (; i + 7 < cols; i += 8) {
-            __m128i b = _mm_loadu_si128((const __m128i *)(row_ptr + (size_t)i * 2u));
-            __m256i u = _mm256_slli_epi32(_mm256_cvtepu16_epi32(b), 16);
-            _mm256_storeu_ps(out + i, _mm256_castsi256_ps(u));
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+        if (asi_cpu_has_avx2_fma_f16c()) {
+            for (; i + 7 < cols; i += 8) {
+                __m128i b = _mm_loadu_si128((const __m128i *)(row_ptr + (size_t)i * 2u));
+                __m256i u = _mm256_slli_epi32(_mm256_cvtepu16_epi32(b), 16);
+                _mm256_storeu_ps(out + i, _mm256_castsi256_ps(u));
+            }
         }
 #endif
         for (; i < cols; ++i) {
@@ -2641,6 +3569,10 @@ static inline void lila_dequant_row(float *out, const uint8_t *row_ptr, int cols
         }
         return;
     }
+    if (quant_type == 100u) {
+        dequant_q4_repack_row(out, row_ptr, cols);
+        return;
+    }
     size_t blk_bytes = lila_quant_block_bytes(quant_type, is_repacked);
     if (blk_bytes == 0u) return;
     int n_blocks = (cols + QK_K - 1) / QK_K;
@@ -2655,6 +3587,34 @@ static inline void lila_dequant_row(float *out, const uint8_t *row_ptr, int cols
             memcpy(out + base, tmp, (size_t)n * sizeof(float));
         }
     }
+}
+
+static inline void lila_dequant_row_at(float *out, const uint8_t *matrix_data, int row,
+                                       int cols, int rows, uint32_t quant_type,
+                                       int is_repacked, int is_col_major) {
+    if (cols <= 0 || rows <= 0 || row < 0 || row >= rows) return;
+    if (quant_type == 101u) {
+        dequant_q3_splitlut_row(out, matrix_data, row, cols);
+        return;
+    }
+    if (is_col_major && quant_type == 100u) {
+        size_t col_bytes = ((size_t)(rows + 63) / 64u) * Q4_REPACK_BLOCK_SIZE;
+        int blk = row >> 6;
+        int lr = row & 63;
+        int byte_off = (lr < 32) ? lr : (lr - 32);
+        int shift = (lr < 32) ? 0 : 4;
+        for (int c = 0; c < cols; ++c) {
+            const uint8_t *bp = matrix_data + (size_t)c * col_bytes + (size_t)blk * Q4_REPACK_BLOCK_SIZE;
+            uint16_t d_raw;
+            memcpy(&d_raw, bp, 2);
+            float d = fp16_to_fp32(d_raw);
+            int q = (int)((bp[2 + byte_off] >> shift) & 0x0Fu) - 8;
+            out[c] = d * (float)q;
+        }
+        return;
+    }
+    size_t rb = lila_quant_row_bytes(quant_type, cols, is_repacked);
+    if (rb > 0u) lila_dequant_row(out, matrix_data + (size_t)row * rb, cols, quant_type, is_repacked);
 }
 
 static inline float lila_quant_dot_fp32(const uint8_t *row_blocks, const float *x, int cols,
@@ -2678,14 +3638,16 @@ static inline float lila_quant_dot_fp32(const uint8_t *row_blocks, const float *
         float total = 0.0f;
         int j = 0;
 #if defined(__AVX2__) && defined(__F16C__)
-        __m256 acc = _mm256_setzero_ps();
-        for (; j + 7 < cols; j += 8) {
-            __m128i h = _mm_loadu_si128((const __m128i *)(row_blocks + (size_t)j * 2u));
-            __m256 wv = _mm256_cvtph_ps(h);
-            __m256 xv = _mm256_loadu_ps(x + j);
-            acc = _mm256_fmadd_ps(wv, xv, acc);
+        if (asi_cpu_has_avx2_fma_f16c()) {
+            __m256 acc = _mm256_setzero_ps();
+            for (; j + 7 < cols; j += 8) {
+                __m128i h = _mm_loadu_si128((const __m128i *)(row_blocks + (size_t)j * 2u));
+                __m256 wv = _mm256_cvtph_ps(h);
+                __m256 xv = _mm256_loadu_ps(x + j);
+                acc = _mm256_fmadd_ps(wv, xv, acc);
+            }
+            total = lila_hsum_f32_avx2(acc);
         }
-        total = lila_hsum_f32_avx2(acc);
 #endif
         for (; j < cols; ++j) {
             uint16_t bits;
@@ -2697,15 +3659,17 @@ static inline float lila_quant_dot_fp32(const uint8_t *row_blocks, const float *
     if (quant_type == 30u) {
         float total = 0.0f;
         int j = 0;
-#if defined(__AVX2__)
-        __m256 acc = _mm256_setzero_ps();
-        for (; j + 7 < cols; j += 8) {
-            __m128i b = _mm_loadu_si128((const __m128i *)(row_blocks + (size_t)j * 2u));
-            __m256 wv = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(b), 16));
-            __m256 xv = _mm256_loadu_ps(x + j);
-            acc = _mm256_fmadd_ps(wv, xv, acc);
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+        if (asi_cpu_has_avx2_fma_f16c()) {
+            __m256 acc = _mm256_setzero_ps();
+            for (; j + 7 < cols; j += 8) {
+                __m128i b = _mm_loadu_si128((const __m128i *)(row_blocks + (size_t)j * 2u));
+                __m256 wv = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(b), 16));
+                __m256 xv = _mm256_loadu_ps(x + j);
+                acc = _mm256_fmadd_ps(wv, xv, acc);
+            }
+            total = lila_hsum_f32_avx2(acc);
         }
-        total = lila_hsum_f32_avx2(acc);
 #endif
         for (; j < cols; ++j) {
             uint16_t bits;
@@ -2726,8 +3690,8 @@ static inline float lila_quant_dot_fp32(const uint8_t *row_blocks, const float *
             int base = b * 32;
             int n = cols - base;
             if (n > 32) n = 32;
-#if defined(__AVX2__)
-            if (n == 32) {
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+            if (asi_cpu_has_avx2_fma_f16c() && n == 32) {
                 __m256 acc = _mm256_setzero_ps();
                 for (int k = 0; k < 32; k += 8) {
                     __m128i q8 = _mm_loadl_epi64((const __m128i *)(qs + k));
@@ -2758,6 +3722,19 @@ static inline float lila_quant_dot_fp32(const uint8_t *row_blocks, const float *
         }
         return total;
     }
+    if (quant_type == 100u) {
+        int n_blocks = (cols + Q4_REPACK_GROUP_SIZE - 1) / Q4_REPACK_GROUP_SIZE;
+        float tmp[Q4_REPACK_GROUP_SIZE];
+        float total = 0.0f;
+        for (int b = 0; b < n_blocks; ++b) {
+            dequant_q4_repack_block(tmp, row_blocks + (size_t)b * Q4_REPACK_BLOCK_SIZE);
+            int base = b * Q4_REPACK_GROUP_SIZE;
+            int n = cols - base;
+            if (n > Q4_REPACK_GROUP_SIZE) n = Q4_REPACK_GROUP_SIZE;
+            total += lila_fp32_dot_slice(tmp, x + base, n);
+        }
+        return total;
+    }
 
     size_t blk_bytes = lila_quant_block_bytes(quant_type, is_repacked);
     if (blk_bytes == 0u) return 0.0f;
@@ -2774,11 +3751,43 @@ static inline float lila_quant_dot_fp32(const uint8_t *row_blocks, const float *
     return total;
 }
 
-static inline void lila_quant_matmul_batch_fp32_range(
+static inline float lila_quant_dot_fp32_at(const uint8_t *matrix_data, int row, const float *x,
+                                           int cols, int rows, uint32_t quant_type,
+                                           int is_repacked, int is_col_major) {
+    if (cols <= 0 || rows <= 0 || row < 0 || row >= rows) return 0.0f;
+    if (quant_type == 101u || (is_col_major && quant_type == 100u)) {
+        float stack_row[4096];
+        float *row_f = (cols <= 4096) ? stack_row : (float *)malloc((size_t)cols * sizeof(float));
+        if (!row_f) return 0.0f;
+        lila_dequant_row_at(row_f, matrix_data, row, cols, rows, quant_type, is_repacked, is_col_major);
+        float res = lila_fp32_dot_slice(row_f, x, cols);
+        if (row_f != stack_row) free(row_f);
+        return res;
+    }
+    size_t rb = lila_quant_row_bytes(quant_type, cols, is_repacked);
+    if (rb == 0u) return 0.0f;
+    return lila_quant_dot_fp32(matrix_data + (size_t)row * rb, x, cols, quant_type, is_repacked);
+}
+
+static inline void lila_quant_matmul_batch_fp32_range_ex(
     const uint8_t *weight_data, const float *x_all, int x_stride,
     float *out, int n_tokens, int total_rows, int row_start, int row_end,
-    int cols, uint32_t quant_type, int is_repacked)
+    int cols, uint32_t quant_type, int is_repacked, int is_col_major)
 {
+    if (quant_type == 101u || (is_col_major && quant_type == 100u)) {
+        float stack_row[4096];
+        float *row_f = (cols <= 4096) ? stack_row : (float *)malloc((size_t)cols * sizeof(float));
+        if (!row_f) return;
+        for (int i = row_start; i < row_end; ++i) {
+            lila_dequant_row_at(row_f, weight_data, i, cols, total_rows, quant_type, is_repacked, is_col_major);
+            for (int t = 0; t < n_tokens; ++t) {
+                const float *xt = x_all + (size_t)t * (size_t)x_stride;
+                out[(size_t)t * (size_t)total_rows + (size_t)i] = lila_fp32_dot_slice(row_f, xt, cols);
+            }
+        }
+        if (row_f != stack_row) free(row_f);
+        return;
+    }
     size_t row_bytes = lila_quant_row_bytes(quant_type, cols, is_repacked);
     if (row_bytes == 0u) return;
 
@@ -2848,6 +3857,34 @@ static inline void lila_quant_matmul_batch_fp32_range(
         return;
     }
 
+    if (quant_type == 100u) {
+        int blocks_per_row = (cols + Q4_REPACK_GROUP_SIZE - 1) / Q4_REPACK_GROUP_SIZE;
+        float tmp[Q4_REPACK_GROUP_SIZE];
+        float acc[64];
+        for (int t_chunk = 0; t_chunk < n_tokens; t_chunk += 64) {
+            int nt = n_tokens - t_chunk;
+            if (nt > 64) nt = 64;
+            for (int i = row_start; i < row_end; ++i) {
+                const uint8_t *row_ptr = weight_data + (size_t)i * row_bytes;
+                for (int t = 0; t < nt; ++t) acc[t] = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    dequant_q4_repack_block(tmp, row_ptr + (size_t)b * Q4_REPACK_BLOCK_SIZE);
+                    int base = b * Q4_REPACK_GROUP_SIZE;
+                    int n = cols - base;
+                    if (n > Q4_REPACK_GROUP_SIZE) n = Q4_REPACK_GROUP_SIZE;
+                    for (int t = 0; t < nt; ++t) {
+                        const float *xt = x_all + (size_t)(t_chunk + t) * (size_t)x_stride + base;
+                        acc[t] += lila_fp32_dot_slice(tmp, xt, n);
+                    }
+                }
+                for (int t = 0; t < nt; ++t) {
+                    out[(size_t)(t_chunk + t) * (size_t)total_rows + (size_t)i] = acc[t];
+                }
+            }
+        }
+        return;
+    }
+
     size_t blk_bytes = lila_quant_block_bytes(quant_type, is_repacked);
     if (blk_bytes == 0u) return;
     int blocks_per_row = (cols + QK_K - 1) / QK_K;
@@ -2875,6 +3912,16 @@ static inline void lila_quant_matmul_batch_fp32_range(
             }
         }
     }
+}
+
+static inline void lila_quant_matmul_batch_fp32_range(
+    const uint8_t *weight_data, const float *x_all, int x_stride,
+    float *out, int n_tokens, int total_rows, int row_start, int row_end,
+    int cols, uint32_t quant_type, int is_repacked)
+{
+    lila_quant_matmul_batch_fp32_range_ex(
+        weight_data, x_all, x_stride, out, n_tokens, total_rows,
+        row_start, row_end, cols, quant_type, is_repacked, 0);
 }
 
 #endif /* LILA_Q4K_H */

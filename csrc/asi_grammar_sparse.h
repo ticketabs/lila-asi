@@ -23,6 +23,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "asi_platform.h"
 #include "lila_lm_head_candidate.h"
 
 #ifdef __cplusplus
@@ -119,50 +120,50 @@ typedef int (*AsiSieveForwardFn)(void *sieve_ctx,
 /* ---- Vocabulary helpers ---- */
 
 /* Build a vocabulary from caller-provided byte strings (copies all strings). */
-int asi_grammar_vocab_from_arrays(AsiGrammarVocab *out_vocab,
-                                  uint32_t vocab_size,
-                                  const char *const *tokens,
-                                  const uint32_t *token_lens);
+ASI_API int asi_grammar_vocab_from_arrays(AsiGrammarVocab *out_vocab,
+                                          uint32_t vocab_size,
+                                          const char *const *tokens,
+                                          const uint32_t *token_lens);
 
 /* Parse ASI_SEC_TOKENIZER JSON directly from an ASI v2 cartridge in pure C11.
  * Decodes GPT-2 byte-level BPE (token_type == 1) and preserves literal
  * user-defined special tokens (token_type == 4, e.g. <tool_call>, </tool_call>). */
-int asi_grammar_vocab_from_asi_json(AsiGrammarVocab *out_vocab,
-                                    const void *sec_ptr,
-                                    size_t sec_size);
+ASI_API int asi_grammar_vocab_from_asi_json(AsiGrammarVocab *out_vocab,
+                                            const void *sec_ptr,
+                                            size_t sec_size);
 
-void asi_grammar_vocab_free(AsiGrammarVocab *vocab);
+ASI_API void asi_grammar_vocab_free(AsiGrammarVocab *vocab);
 
 /* Longest-match greedy tokenization of UTF-8/ASCII text using AsiGrammarVocab.
  * Returns number of tokens written, or -1 on error. */
-int asi_grammar_vocab_greedy_encode(const AsiGrammarVocab *vocab,
-                                    const char *text,
-                                    size_t text_len,
-                                    int32_t *out_ids,
-                                    uint32_t max_ids);
+ASI_API int asi_grammar_vocab_greedy_encode(const AsiGrammarVocab *vocab,
+                                            const char *text,
+                                            size_t text_len,
+                                            int32_t *out_ids,
+                                            uint32_t max_ids);
 
 /* ---- Grammar Engine Lifecycle ---- */
 
-AsiGrammarEngine *asi_grammar_create(const AsiGrammarVocab *vocab,
-                                     const AsiToolSchema *tools,
-                                     uint32_t n_tools,
-                                     const AsiGrammarConfig *cfg);
+ASI_API AsiGrammarEngine *asi_grammar_create(const AsiGrammarVocab *vocab,
+                                             const AsiToolSchema *tools,
+                                             uint32_t n_tools,
+                                             const AsiGrammarConfig *cfg);
 
-void asi_grammar_free(AsiGrammarEngine *g);
-void asi_grammar_reset(AsiGrammarEngine *g);
-int  asi_grammar_is_complete(const AsiGrammarEngine *g);
-int32_t asi_grammar_state(const AsiGrammarEngine *g);
-uint32_t asi_grammar_num_states(const AsiGrammarEngine *g);
-uint32_t asi_grammar_sparse_limit(const AsiGrammarEngine *g);
-void asi_grammar_get_telemetry(const AsiGrammarEngine *g, AsiGrammarTelemetry *out);
+ASI_API void asi_grammar_free(AsiGrammarEngine *g);
+ASI_API void asi_grammar_reset(AsiGrammarEngine *g);
+ASI_API int  asi_grammar_is_complete(const AsiGrammarEngine *g);
+ASI_API int32_t asi_grammar_state(const AsiGrammarEngine *g);
+ASI_API uint32_t asi_grammar_num_states(const AsiGrammarEngine *g);
+ASI_API uint32_t asi_grammar_sparse_limit(const AsiGrammarEngine *g);
+ASI_API void asi_grammar_get_telemetry(const AsiGrammarEngine *g, AsiGrammarTelemetry *out);
 
 /* ---- Incremental Masking & Forced-Token Fast-Forward ---- */
 
 /* Compute (or fetch cached) sorted ascending legal token IDs for the current DFA state.
  * Returned pointer is owned by AsiGrammarEngine and valid until asi_grammar_free(). */
-int asi_grammar_get_legal_ids(AsiGrammarEngine *g,
-                              const int32_t **out_legal_ids,
-                              uint32_t *out_n_legal);
+ASI_API int asi_grammar_get_legal_ids(AsiGrammarEngine *g,
+                                      const int32_t **out_legal_ids,
+                                      uint32_t *out_n_legal);
 
 /* Case 1: Collect consecutive forced tokens (deterministic literal prefixes AND
  * single-legal-token steps) in one shot so the caller can feed them via
@@ -170,112 +171,112 @@ int asi_grammar_get_legal_ids(AsiGrammarEngine *g,
  * Advances the grammar state across all collected forced tokens and updates telemetry.
  * Returns number of forced tokens collected (0 if at a branching choice point or complete),
  * or -1 on error. */
-int asi_grammar_collect_forced_run(AsiGrammarEngine *g,
-                                   int32_t *out_token_ids,
-                                   uint32_t max_tokens,
-                                   AsiForcedReason *out_reason);
+ASI_API int asi_grammar_collect_forced_run(AsiGrammarEngine *g,
+                                           int32_t *out_token_ids,
+                                           uint32_t max_tokens,
+                                           AsiForcedReason *out_reason);
 
 /* Advance grammar state by a sampled token ID (records lm_head_calls++). */
-int asi_grammar_accept_token(AsiGrammarEngine *g, int32_t token_id);
+ASI_API int asi_grammar_accept_token(AsiGrammarEngine *g, int32_t token_id);
 
 /* Mask an existing full-vocab logits buffer in-place: illegal tokens -> -1e30f. */
-int asi_grammar_mask_logits(AsiGrammarEngine *g, float *logits, uint32_t vocab_size);
+ASI_API int asi_grammar_mask_logits(AsiGrammarEngine *g, float *logits, uint32_t vocab_size);
 
 /* ---- Case 2 & Case 3: Grammar-Aware Sparse lm_head ---- */
 
-int asi_grammar_sparse_lm_head_quant(const uint8_t *weights,
-                                     uint32_t quant_type,
-                                     int is_repacked,
-                                     uint32_t vocab_size,
-                                     uint32_t hidden_size,
-                                     const float *x_norm,
-                                     const int32_t *legal_ids,
-                                     uint32_t n_legal,
-                                     float *out_logits,
-                                     int fp32_ref,
-                                     LilaLhcDispatchFn dispatch_fn,
-                                     void *pool_opaque);
+ASI_API int asi_grammar_sparse_lm_head_quant(const uint8_t *weights,
+                                             uint32_t quant_type,
+                                             int is_repacked,
+                                             uint32_t vocab_size,
+                                             uint32_t hidden_size,
+                                             const float *x_norm,
+                                             const int32_t *legal_ids,
+                                             uint32_t n_legal,
+                                             float *out_logits,
+                                             int fp32_ref,
+                                             LilaLhcDispatchFn dispatch_fn,
+                                             void *pool_opaque);
 
-int asi_grammar_full_lm_head_quant(const uint8_t *weights,
-                                   uint32_t quant_type,
-                                   int is_repacked,
-                                   uint32_t vocab_size,
-                                   uint32_t hidden_size,
-                                   const float *x_norm,
-                                   float *out_logits,
-                                   int fp32_ref,
-                                   LilaLhcDispatchFn dispatch_fn,
-                                   void *pool_opaque);
+ASI_API int asi_grammar_full_lm_head_quant(const uint8_t *weights,
+                                           uint32_t quant_type,
+                                           int is_repacked,
+                                           uint32_t vocab_size,
+                                           uint32_t hidden_size,
+                                           const float *x_norm,
+                                           float *out_logits,
+                                           int fp32_ref,
+                                           LilaLhcDispatchFn dispatch_fn,
+                                           void *pool_opaque);
 
-int asi_grammar_lm_head_forward_quant(AsiGrammarEngine *g,
-                                      const uint8_t *weights,
-                                      uint32_t quant_type,
-                                      int is_repacked,
-                                      uint32_t vocab_size,
-                                      uint32_t hidden_size,
-                                      const float *x_norm,
-                                      float *out_logits,
-                                      int fp32_ref,
-                                      LilaLhcDispatchFn dispatch_fn,
-                                      void *pool_opaque,
-                                      AsiSieveForwardFn sieve_fn,
-                                      void *sieve_ctx,
-                                      AsiGrammarDispatchMode *out_mode);
+ASI_API int asi_grammar_lm_head_forward_quant(AsiGrammarEngine *g,
+                                              const uint8_t *weights,
+                                              uint32_t quant_type,
+                                              int is_repacked,
+                                              uint32_t vocab_size,
+                                              uint32_t hidden_size,
+                                              const float *x_norm,
+                                              float *out_logits,
+                                              int fp32_ref,
+                                              LilaLhcDispatchFn dispatch_fn,
+                                              void *pool_opaque,
+                                              AsiSieveForwardFn sieve_fn,
+                                              void *sieve_ctx,
+                                              AsiGrammarDispatchMode *out_mode);
 
 /* Case 2 core kernel:
  * Fills out_logits[0..vocab_size-1] with -1e30f, quantizes x_norm once to Q8_K
  * (unless fp32_ref != 0), and evaluates exact Q6_K ONLY on legal_ids[0..n_legal-1]
  * (must be sorted ascending for optimal DRAM prefetching). */
-int asi_grammar_sparse_lm_head_q6k(const uint8_t *q6k_weights,
-                                   uint32_t vocab_size,
-                                   uint32_t hidden_size,
-                                   const float *x_norm,
-                                   const int32_t *legal_ids,
-                                   uint32_t n_legal,
-                                   float *out_logits,
-                                   int fp32_ref,
-                                   LilaLhcDispatchFn dispatch_fn,
-                                   void *pool_opaque);
+ASI_API int asi_grammar_sparse_lm_head_q6k(const uint8_t *q6k_weights,
+                                           uint32_t vocab_size,
+                                           uint32_t hidden_size,
+                                           const float *x_norm,
+                                           const int32_t *legal_ids,
+                                           uint32_t n_legal,
+                                           float *out_logits,
+                                           int fp32_ref,
+                                           LilaLhcDispatchFn dispatch_fn,
+                                           void *pool_opaque);
 
 /* Exact full-vocab Q6_K reference matvec (for parity testing and Case 3 fallback). */
-int asi_grammar_full_lm_head_q6k(const uint8_t *q6k_weights,
-                                 uint32_t vocab_size,
-                                 uint32_t hidden_size,
-                                 const float *x_norm,
-                                 float *out_logits,
-                                 int fp32_ref,
-                                 LilaLhcDispatchFn dispatch_fn,
-                                 void *pool_opaque);
+ASI_API int asi_grammar_full_lm_head_q6k(const uint8_t *q6k_weights,
+                                         uint32_t vocab_size,
+                                         uint32_t hidden_size,
+                                         const float *x_norm,
+                                         float *out_logits,
+                                         int fp32_ref,
+                                         LilaLhcDispatchFn dispatch_fn,
+                                         void *pool_opaque);
 
 /* Unified Grammar-Aware lm_head Forward:
  *   - If g == NULL: runs Sieve (if sieve_fn != NULL) else full Q6_K.
  *   - If 1 <= n_legal <= sparse_limit: Case 2 -> Grammar-Aware Sparse Q6_K (skips Sieve!).
  *   - If n_legal > sparse_limit: Case 3 -> Sieve (or full Q6_K) + grammar mask (-1e30f),
  *     with automatic sparse fallback if Sieve's top-K has 0 legal tokens. */
-int asi_grammar_lm_head_forward_q6k(AsiGrammarEngine *g,
-                                    const uint8_t *q6k_weights,
-                                    uint32_t vocab_size,
-                                    uint32_t hidden_size,
-                                    const float *x_norm,
-                                    float *out_logits,
-                                    int fp32_ref,
-                                    LilaLhcDispatchFn dispatch_fn,
-                                    void *pool_opaque,
-                                    AsiSieveForwardFn sieve_fn,
-                                    void *sieve_ctx,
-                                    AsiGrammarDispatchMode *out_mode);
+ASI_API int asi_grammar_lm_head_forward_q6k(AsiGrammarEngine *g,
+                                            const uint8_t *q6k_weights,
+                                            uint32_t vocab_size,
+                                            uint32_t hidden_size,
+                                            const float *x_norm,
+                                            float *out_logits,
+                                            int fp32_ref,
+                                            LilaLhcDispatchFn dispatch_fn,
+                                            void *pool_opaque,
+                                            AsiSieveForwardFn sieve_fn,
+                                            void *sieve_ctx,
+                                            AsiGrammarDispatchMode *out_mode);
 
 /* ---- Built-in C11 Schema-Compliant JSON Validator (for tests & benchmarks) ---- */
 
 /* Validates that `text` (optionally wrapped in <tool_call>\n...\n</tool_call>)
  * is strictly valid JSON matching one of tools[0..n_tools-1] with exact tool name,
  * exact required arguments, and valid typed values. Returns 1 if valid, 0 if invalid. */
-int asi_grammar_validate_tool_call(const char *text,
-                                   const AsiToolSchema *tools,
-                                   uint32_t n_tools,
-                                   int wrap_xml,
-                                   char *err_buf,
-                                   size_t err_cap);
+ASI_API int asi_grammar_validate_tool_call(const char *text,
+                                           const AsiToolSchema *tools,
+                                           uint32_t n_tools,
+                                           int wrap_xml,
+                                           char *err_buf,
+                                           size_t err_cap);
 
 #ifdef __cplusplus
 }

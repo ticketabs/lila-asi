@@ -1,6 +1,6 @@
-# Lila ASI v2.4 (`lila-asi`) — Active System Image Inference Engine
+# Lila ASI v2.6 (`lila-asi`) — Active System Image + Universal `.asiv` Vision Runtime
 
-`lila-asi` is a standalone, zero-dependency C11 + Python inference runtime and cartridge format (`.asi`) built for fast local CPU inference on both **hybrid Gated DeltaNet + Full-Attention** models (`Qwen3.5`) and **dense Transformer** models (`Llama`, `Qwen2`, `Qwen3`, `Gemma`).
+`lila-asi` is a standalone C11 + Python inference runtime and cartridge format (`.asi` for LLMs, `.asiv` for vision encoders/projectors) built for fast local CPU inference on **hybrid Gated DeltaNet + Full-Attention** models (`Qwen3.5`, `Qwen3.5-VL`), **dense Transformers** (`Llama`, `Qwen2`, `Qwen3`, `Gemma`), and **Universal ViT / Multimodal Encoders** via declarative `ASIG0001` computation graphs.
 
 Supports universal 8-format quantization (**`F32`**, **`F16`**, **`BF16`**, **`Q4_0`**, **`Q8_0`**, **`Q4_K`**, **`Q5_K`**, **`Q6_K`**) across both the **Sieve `1bit1024` two-stage `lm_head`** and **E05 v2 Grammar-Aware Sparse Head**.
 
@@ -17,14 +17,20 @@ Supports universal 8-format quantization (**`F32`**, **`F16`**, **`BF16`**, **`Q
 
 ## 1. Command-Line Quickstart (`asi-cli` & `lila-asi-cli`)
 
-### A. Convert a `.gguf` model into an `.asi` cartridge
+### A. Convert any `.gguf` (LLM or Vision `mmproj`) into `.asi` / `.asiv`
 ```bash
+# Auto-detects LLM GGUF (-> model.asi) or vision mmproj GGUF (-> mmproj.asiv)
 ./bin/asi-cli pack /path/to/model.gguf -o model.asi
+./bin/asi-cli pack /path/to/mmproj.gguf -o mmproj.asiv
+
+# Or pack paired text + vision together in one shot:
+./bin/asi-cli pack /path/to/model.gguf -o model.asi --mmproj /path/to/mmproj.gguf
 ```
 
-### B. Inspect cartridge architecture, memory footprint, and CRC-64 sections
+### B. Inspect cartridge or `.asiv` vision sidecar headers, sections, and CRC-64
 ```bash
 ./bin/asi-cli info model.asi
+./bin/asi-cli info mmproj.asiv
 ```
 
 ### C. Run streaming generation or interactive chat

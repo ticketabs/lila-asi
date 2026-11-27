@@ -1,23 +1,40 @@
 #ifndef LILA_ASI_POOL_H
 #define LILA_ASI_POOL_H
 
-#include <pthread.h>
-#include <sched.h>
+#include "asi_platform.h"
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef __linux__
-#include <dirent.h>
-#include <unistd.h>
+
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#  include <process.h>
+#else
+#  include <pthread.h>
+#  include <sched.h>
+#  ifdef __linux__
+#    include <dirent.h>
+#    include <unistd.h>
+#  endif
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
-#include <immintrin.h>
-#define asi_cpu_pause() _mm_pause()
+#  if defined(__AVX2__) || defined(__AVX512F__) || defined(__SSE2__)
+#    include <xmmintrin.h>
+#    define asi_cpu_pause() _mm_pause()
+#  elif defined(_MSC_VER)
+#    include <intrin.h>
+#    define asi_cpu_pause() _mm_pause()
+#  else
+#    define asi_cpu_pause() __asm__ volatile("pause" ::: "memory")
+#  endif
 #else
-#define asi_cpu_pause() ((void)0)
+#  define asi_cpu_pause() ((void)0)
 #endif
 
 typedef void (*AsiTaskFn)(int tid, int n_threads, void *ctx);
@@ -26,9 +43,15 @@ typedef struct {
     int n_threads;
     int spin_limit;
     int yield_limit;
+#if defined(_WIN32)
+    HANDLE *threads;
+    CRITICAL_SECTION mu;
+    CONDITION_VARIABLE cv_work;
+#else
     pthread_t *threads;
     pthread_mutex_t mu;
     pthread_cond_t cv_work;
+#endif
     _Alignas(64) AsiTaskFn fn;
     void *ctx;
     _Alignas(64) atomic_int gen;
@@ -43,6 +66,60 @@ typedef struct {
     int tid;
 } AsiWorkerArg;
 
+#if defined(_WIN32)
+static inline unsigned __stdcall asi_pool_worker(void *arg)
+{
+    AsiWorkerArg *wa = (AsiWorkerArg *)arg;
+    AsiThreadPool *p = wa->pool;
+    int tid = wa->tid;
+    int last_gen = 0;
+
+    for (;;)
+    {
+        int spins = 0;
+        int cur_gen = atomic_load_explicit(&p->gen, memory_order_acquire);
+        while (cur_gen == last_gen)
+        {
+            if (atomic_load_explicit(&p->shutdown, memory_order_acquire))
+            {
+                free(wa);
+                return 0;
+            }
+            int active = atomic_load_explicit(&p->active, memory_order_acquire);
+            if (active && spins < p->spin_limit)
+            {
+                asi_cpu_pause();
+                spins++;
+            }
+            else if (active && spins < p->yield_limit)
+            {
+                SwitchToThread();
+                spins++;
+            }
+            else
+            {
+                EnterCriticalSection(&p->mu);
+                atomic_fetch_add_explicit(&p->sleeping, 1, memory_order_seq_cst);
+                while ((cur_gen = atomic_load_explicit(&p->gen, memory_order_seq_cst)) == last_gen &&
+                       !atomic_load_explicit(&p->shutdown, memory_order_acquire))
+                {
+                    SleepConditionVariableCS(&p->cv_work, &p->mu, INFINITE);
+                }
+                atomic_fetch_sub_explicit(&p->sleeping, 1, memory_order_release);
+                LeaveCriticalSection(&p->mu);
+                spins = 0;
+                continue;
+            }
+            cur_gen = atomic_load_explicit(&p->gen, memory_order_acquire);
+        }
+        last_gen = cur_gen;
+
+        p->fn(tid, p->n_threads, p->ctx);
+
+        atomic_fetch_add_explicit(&p->done_count, 1, memory_order_acq_rel);
+    }
+}
+#else
 static void *asi_pool_worker(void *arg)
 {
     AsiWorkerArg *wa = (AsiWorkerArg *)arg;
@@ -95,6 +172,7 @@ static void *asi_pool_worker(void *arg)
         atomic_fetch_add_explicit(&p->done_count, 1, memory_order_acq_rel);
     }
 }
+#endif
 
 static inline int asi_detect_physical_cores(void)
 {
@@ -154,6 +232,9 @@ static inline int asi_detect_physical_cores(void)
     }
     long n_onln = sysconf(_SC_NPROCESSORS_ONLN);
     return (n_onln > 1) ? (int)(n_onln / 2) : 1;
+#elif defined(_WIN32)
+    int n_onln = asi_num_procs();
+    return (n_onln > 1) ? (n_onln / 2) : 1;
 #else
     return 1;
 #endif
@@ -162,7 +243,7 @@ static inline int asi_detect_physical_cores(void)
 static inline AsiThreadPool *asi_pool_create(int n_threads)
 {
     if (n_threads < 1) n_threads = 1;
-    AsiThreadPool *p = (AsiThreadPool *)aligned_alloc(64, sizeof(AsiThreadPool));
+    AsiThreadPool *p = (AsiThreadPool *)asi_aligned_alloc(64, sizeof(AsiThreadPool));
     if (!p) return NULL;
     memset(p, 0, sizeof(AsiThreadPool));
     p->n_threads = n_threads;
@@ -182,8 +263,13 @@ static inline AsiThreadPool *asi_pool_create(int n_threads)
         }
     }
 
+#if defined(_WIN32)
+    InitializeCriticalSection(&p->mu);
+    InitializeConditionVariable(&p->cv_work);
+#else
     pthread_mutex_init(&p->mu, NULL);
     pthread_cond_init(&p->cv_work, NULL);
+#endif
     atomic_init(&p->gen, 0);
     atomic_init(&p->done_count, 0);
     atomic_init(&p->active, 0);
@@ -192,6 +278,17 @@ static inline AsiThreadPool *asi_pool_create(int n_threads)
 
     if (n_threads > 1)
     {
+#if defined(_WIN32)
+        p->threads = (HANDLE *)calloc((size_t)(n_threads - 1), sizeof(HANDLE));
+        for (int t = 1; t < n_threads; ++t)
+        {
+            AsiWorkerArg *wa = (AsiWorkerArg *)malloc(sizeof(AsiWorkerArg));
+            wa->pool = p;
+            wa->tid = t;
+            uintptr_t h = _beginthreadex(NULL, 0, asi_pool_worker, wa, 0, NULL);
+            p->threads[t - 1] = (HANDLE)h;
+        }
+#else
         p->threads = (pthread_t *)calloc((size_t)(n_threads - 1), sizeof(pthread_t));
         for (int t = 1; t < n_threads; ++t)
         {
@@ -200,6 +297,7 @@ static inline AsiThreadPool *asi_pool_create(int n_threads)
             wa->tid = t;
             pthread_create(&p->threads[t - 1], NULL, asi_pool_worker, wa);
         }
+#endif
     }
     return p;
 }
@@ -207,6 +305,22 @@ static inline AsiThreadPool *asi_pool_create(int n_threads)
 static inline void asi_pool_destroy(AsiThreadPool *p)
 {
     if (!p) return;
+#if defined(_WIN32)
+    EnterCriticalSection(&p->mu);
+    atomic_store_explicit(&p->shutdown, 1, memory_order_release);
+    WakeAllConditionVariable(&p->cv_work);
+    LeaveCriticalSection(&p->mu);
+    for (int t = 1; t < p->n_threads; ++t)
+    {
+        if (p->threads[t - 1])
+        {
+            WaitForSingleObject(p->threads[t - 1], INFINITE);
+            CloseHandle(p->threads[t - 1]);
+        }
+    }
+    free(p->threads);
+    DeleteCriticalSection(&p->mu);
+#else
     pthread_mutex_lock(&p->mu);
     atomic_store_explicit(&p->shutdown, 1, memory_order_release);
     pthread_cond_broadcast(&p->cv_work);
@@ -218,7 +332,8 @@ static inline void asi_pool_destroy(AsiThreadPool *p)
     free(p->threads);
     pthread_mutex_destroy(&p->mu);
     pthread_cond_destroy(&p->cv_work);
-    free(p);
+#endif
+    asi_aligned_free(p);
 }
 
 static inline void asi_pool_begin(AsiThreadPool *p)
@@ -247,9 +362,15 @@ static inline void asi_pool_run(AsiThreadPool *p, AsiTaskFn fn, void *ctx)
     atomic_fetch_add_explicit(&p->gen, 1, memory_order_seq_cst);
     if (!was_active || atomic_load_explicit(&p->sleeping, memory_order_seq_cst) > 0)
     {
+#if defined(_WIN32)
+        EnterCriticalSection(&p->mu);
+        WakeAllConditionVariable(&p->cv_work);
+        LeaveCriticalSection(&p->mu);
+#else
         pthread_mutex_lock(&p->mu);
         pthread_cond_broadcast(&p->cv_work);
         pthread_mutex_unlock(&p->mu);
+#endif
     }
 
     fn(0, p->n_threads, ctx);
@@ -264,7 +385,11 @@ static inline void asi_pool_run(AsiThreadPool *p, AsiTaskFn fn, void *ctx)
         }
         else
         {
+#if defined(_WIN32)
+            SwitchToThread();
+#else
             sched_yield();
+#endif
         }
     }
 }

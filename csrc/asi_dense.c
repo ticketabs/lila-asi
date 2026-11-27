@@ -5,12 +5,10 @@
 
 #include <errno.h>
 #include <math.h>
-#include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #define ASI_DENSE_SESSION_MAGIC 0x44454E53u /* "DENS" */
 #define ASI_DENSE_DEFAULT_BATCH_CHUNK 512u
@@ -186,11 +184,12 @@ static inline const uint8_t *dense_tensor_data(const AsiV2Cartridge *cart, const
 static size_t dense_expected_bytes(uint32_t quant_type, uint32_t layout_flags, uint64_t cols, uint64_t rows)
 {
     if (cols == 0 || rows == 0) return 0;
-    size_t rb = lila_quant_row_bytes(
+    return lila_quant_matrix_bytes(
         quant_type,
-        (int)cols,
-        (layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK) ? 1 : 0);
-    return rb * (size_t)rows;
+        cols,
+        rows,
+        (layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK) ? 1 : 0,
+        (layout_flags & ASI_TENSOR_LAYOUT_COL_MAJOR) ? 1 : 0);
 }
 
 static const AsiV2TensorEntry *dense_req_2d(const AsiV2Cartridge *cart,
@@ -452,10 +451,11 @@ static int dense_lookup_embed(const DenseSession *s, int32_t token_id, float *ou
     return 0;
 }
 
-static float dense_dot_row_fp32(const uint8_t *row_ptr, const float *x, int cols,
-                                uint32_t quant_type, int is_repacked)
+static float dense_dot_row_fp32(const uint8_t *w_base, int row, const float *x,
+                                int cols, int rows, uint32_t quant_type,
+                                int is_repacked, int is_col_major)
 {
-    return lila_quant_dot_fp32(row_ptr, x, cols, quant_type, is_repacked);
+    return lila_quant_dot_fp32_at(w_base, row, x, cols, rows, quant_type, is_repacked, is_col_major);
 }
 
 static float dense_q6k_repacked_dot_q8k(const uint8_t *row_ptr, const LilaQ8KBlock *qx, int bpr)
@@ -568,14 +568,19 @@ typedef struct {
     int rows[3];
     uint32_t quant_type[3];
     int is_repacked[3];
+    int is_col_major[3];
     size_t row_bytes[3];
     int n_mats;
 
     const float *in;
     const LilaQ8KBlock *qx;
+    const LilaQ8_64Block *qx64;
+    const LilaQ3LutBlock *q3_luts;
     int n_tokens;
     int cols;
     int bpr;
+    int n_blk64;
+    int n_blk128;
     int fp32_ref;
     int apply_ffn_act;
     DenseFfnAct ffn_act;
@@ -587,12 +592,58 @@ static void dense_eval_mat_range(const DenseMatmulCtx *ctx, int m, int start, in
 {
     uint32_t qt = ctx->quant_type[m];
     int rep = ctx->is_repacked[m];
+    int cm = ctx->is_col_major[m];
     int n_tok = ctx->n_tokens;
     int rows = ctx->rows[m];
     int cols = ctx->cols;
     size_t rb = ctx->row_bytes[m];
 
-    if (!ctx->fp32_ref && (qt == 12u || qt == 14u))
+    if (!ctx->fp32_ref && qt == ASI_QUANT_Q4_REPACK && !cm)
+    {
+        if (n_tok <= 1)
+            q4_repack_matvec_range(ctx->out[m], ctx->w[m], ctx->qx64, start, end, ctx->n_blk64);
+        else
+            q4_repack_matmul_batch_q8_range(ctx->out[m], ctx->w[m], ctx->qx64, n_tok, start, end, rows, ctx->n_blk64);
+    }
+    else if (!ctx->fp32_ref && qt == ASI_QUANT_Q3_SPLITLUT)
+    {
+        if (n_tok <= 1)
+        {
+            q3_splitlut_matvec_range(ctx->out[m], ctx->w[m], ctx->q3_luts, start, end, rows, ctx->n_blk128);
+        }
+        else
+        {
+            size_t tile_bytes = (size_t)ctx->n_blk128 * Q3_SPLITLUT_BLK_BYTES;
+            int t0 = start / Q3_SPLITLUT_TILE_ROWS;
+            int t1 = (end + Q3_SPLITLUT_TILE_ROWS - 1) / Q3_SPLITLUT_TILE_ROWS;
+            for (int tile = t0; tile < t1; ++tile)
+            {
+                int r_base = tile * Q3_SPLITLUT_TILE_ROWS;
+                int valid = rows - r_base;
+                if (valid > Q3_SPLITLUT_TILE_ROWS) valid = Q3_SPLITLUT_TILE_ROWS;
+                const uint8_t *tp = ctx->w[m] + (size_t)tile * tile_bytes;
+                for (int tok = 0; tok < n_tok; ++tok)
+                {
+                    const LilaQ3LutBlock *lb = ctx->q3_luts + (size_t)tok * (size_t)ctx->n_blk128;
+                    if (r_base >= start && r_base + valid <= end)
+                    {
+                        q3_splitlut_tile_simd(tp, ctx->n_blk128, lb, valid,
+                                              ctx->out[m] + (size_t)tok * (size_t)rows + (size_t)r_base);
+                    }
+                    else
+                    {
+                        float tmp[Q3_SPLITLUT_TILE_ROWS];
+                        q3_splitlut_tile_simd(tp, ctx->n_blk128, lb, valid, tmp);
+                        int lo = (start > r_base) ? (start - r_base) : 0;
+                        int hi = (end < r_base + valid) ? (end - r_base) : valid;
+                        float *dst = ctx->out[m] + (size_t)tok * (size_t)rows;
+                        for (int lr = lo; lr < hi; ++lr) dst[r_base + lr] = tmp[lr];
+                    }
+                }
+            }
+        }
+    }
+    else if (!ctx->fp32_ref && (qt == 12u || qt == 14u))
     {
         if (n_tok <= 1)
         {
@@ -622,10 +673,10 @@ static void dense_eval_mat_range(const DenseMatmulCtx *ctx, int m, int start, in
             }
         }
     }
-    else if (ctx->fp32_ref && (qt == 12u || qt == 14u) && n_tok > 1)
+    else if (ctx->fp32_ref && (qt == 12u || qt == 14u || qt == 100u || qt == 101u) && n_tok > 1)
     {
-        lila_quant_matmul_batch_fp32_range(ctx->w[m], ctx->in, cols, ctx->out[m],
-                                            n_tok, rows, start, end, cols, qt, rep);
+        lila_quant_matmul_batch_fp32_range_ex(ctx->w[m], ctx->in, cols, ctx->out[m],
+                                               n_tok, rows, start, end, cols, qt, rep, cm);
     }
     else
     {
@@ -635,9 +686,7 @@ static void dense_eval_mat_range(const DenseMatmulCtx *ctx, int m, int start, in
             float *ot = ctx->out[m] + (size_t)t * (size_t)rows;
             for (int i = start; i < end; ++i)
             {
-                const uint8_t *rp = ctx->w[m] + (size_t)i * rb;
-                if (i + 2 < end) LILA_PREFETCH(rp + 2 * rb);
-                ot[i] = dense_dot_row_fp32(rp, xt, cols, qt, rep);
+                ot[i] = dense_dot_row_fp32(ctx->w[m], i, xt, cols, rows, qt, rep, cm);
             }
         }
     }
@@ -763,11 +812,15 @@ static int dense_matmul_multi(DenseSession *s,
     ctx.n_tokens = n_tokens;
     ctx.cols = cols;
     ctx.bpr = (cols + QK_K - 1) / QK_K;
+    ctx.n_blk64 = (cols + Q4_REPACK_GROUP_SIZE - 1) / Q4_REPACK_GROUP_SIZE;
+    ctx.n_blk128 = (cols + Q3_SPLITLUT_BLK_COLS - 1) / Q3_SPLITLUT_BLK_COLS;
     ctx.fp32_ref = s->fp32_ref;
     ctx.apply_ffn_act = apply_ffn_act;
     ctx.ffn_act = s->ffn_act;
 
     int needs_q8k = 0;
+    int needs_q8_64 = 0;
+    int needs_q3 = 0;
     int max_rows = 0;
     for (int m = 0; m < n_mats; ++m)
     {
@@ -776,12 +829,17 @@ static int dense_matmul_multi(DenseSession *s,
         ctx.rows[m] = (int)ts[m]->shape[1];
         ctx.quant_type[m] = ts[m]->quant_type;
         ctx.is_repacked[m] = (ts[m]->layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK) ? 1 : 0;
-        ctx.row_bytes[m] = dense_expected_bytes(ts[m]->quant_type, ts[m]->layout_flags, (uint64_t)cols, 1u);
+        ctx.is_col_major[m] = (ts[m]->layout_flags & ASI_TENSOR_LAYOUT_COL_MAJOR) ? 1 : 0;
+        ctx.row_bytes[m] = lila_quant_row_bytes(ts[m]->quant_type, cols, ctx.is_repacked[m]);
         ctx.bias[m] = biases ? biases[m] : NULL;
         atomic_init(&ctx.next_row[m], 0);
         if (ctx.rows[m] > max_rows) max_rows = ctx.rows[m];
         if (!s->fp32_ref && (ts[m]->quant_type == 12u || ts[m]->quant_type == 14u))
             needs_q8k = 1;
+        if (!s->fp32_ref && ts[m]->quant_type == ASI_QUANT_Q4_REPACK && !ctx.is_col_major[m])
+            needs_q8_64 = 1;
+        if (!s->fp32_ref && ts[m]->quant_type == ASI_QUANT_Q3_SPLITLUT)
+            needs_q3 = 1;
     }
 
     LilaQ8KBlock stack_qx[64];
@@ -794,14 +852,42 @@ static int dense_matmul_multi(DenseSession *s,
         dense_quantize_batch_q8k(s->pool, tmp_qx, in, n_tokens, cols);
         ctx.qx = tmp_qx;
     }
+    LilaQ8_64Block stack_qx64[128];
+    LilaQ8_64Block *tmp_qx64 = NULL;
+    if (needs_q8_64)
+    {
+        size_t need = (size_t)n_tokens * (size_t)ctx.n_blk64;
+        tmp_qx64 = (need <= 128u) ? stack_qx64 : (LilaQ8_64Block *)dense_aligned_alloc(32u, need * sizeof(LilaQ8_64Block));
+        if (!tmp_qx64) { if (tmp_qx && tmp_qx != stack_qx) dense_aligned_free(tmp_qx); return -1; }
+        for (int tok = 0; tok < n_tokens; ++tok)
+            quantize_vec_q8_64_strided(tmp_qx64 + tok, n_tokens, in + (size_t)tok * (size_t)cols, cols);
+        ctx.qx64 = tmp_qx64;
+    }
+    LilaQ3LutBlock stack_q3[32];
+    LilaQ3LutBlock *tmp_q3 = NULL;
+    if (needs_q3)
+    {
+        size_t need = (size_t)n_tokens * (size_t)ctx.n_blk128;
+        tmp_q3 = (need <= 32u) ? stack_q3 : (LilaQ3LutBlock *)dense_aligned_alloc(32u, need * sizeof(LilaQ3LutBlock));
+        if (!tmp_q3)
+        {
+            if (tmp_qx && tmp_qx != stack_qx) dense_aligned_free(tmp_qx);
+            if (tmp_qx64 && tmp_qx64 != stack_qx64) dense_aligned_free(tmp_qx64);
+            return -1;
+        }
+        for (int tok = 0; tok < n_tokens; ++tok)
+            q3_splitlut_build_lut(tmp_q3 + (size_t)tok * (size_t)ctx.n_blk128, in + (size_t)tok * (size_t)cols, cols);
+        ctx.q3_luts = tmp_q3;
+    }
 
     if (s->pool && (max_rows >= 32 || (max_rows >= 16 && n_tokens > 1)))
         asi_pool_run(s->pool, dense_matmul_worker, &ctx);
     else
         dense_matmul_worker(0, 1, &ctx);
 
-    if (tmp_qx && tmp_qx != stack_qx)
-        dense_aligned_free(tmp_qx);
+    if (tmp_qx && tmp_qx != stack_qx) dense_aligned_free(tmp_qx);
+    if (tmp_qx64 && tmp_qx64 != stack_qx64) dense_aligned_free(tmp_qx64);
+    if (tmp_q3 && tmp_q3 != stack_q3) dense_aligned_free(tmp_q3);
     return 0;
 }
 
@@ -1994,7 +2080,7 @@ _Static_assert(sizeof(DensePrefixSnapshotHeader) == 144, "DensePrefixSnapshotHea
 _Static_assert(offsetof(DensePrefixSnapshotHeader, header_crc64) == 136, "header_crc64 offset mismatch");
 
 static uint64_t g_dense_crc64_tab[256];
-static pthread_once_t g_dense_crc64_once = PTHREAD_ONCE_INIT;
+static AsiOnce g_dense_crc64_once = ASI_ONCE_INIT;
 
 static void dense_crc64_init(void)
 {
@@ -2009,7 +2095,7 @@ static void dense_crc64_init(void)
 
 static uint64_t dense_crc64_update(uint64_t crc, const uint8_t *data, size_t len)
 {
-    pthread_once(&g_dense_crc64_once, dense_crc64_init);
+    asi_call_once(&g_dense_crc64_once, dense_crc64_init);
     for (size_t i = 0; i < len; ++i)
         crc = (crc << 8) ^ g_dense_crc64_tab[((crc >> 56) ^ data[i]) & 0xFFu];
     return crc;
@@ -2104,7 +2190,7 @@ static int dense_save_prefix_file(const AsiArchSession *session,
     size_t tcap = flen + 64u;
     char *tmp_path = (char *)malloc(tcap);
     if (!tmp_path) return -1;
-    int tn = snprintf(tmp_path, tcap, "%s.tmp.%ld", filepath, (long)getpid());
+    int tn = snprintf(tmp_path, tcap, "%s.tmp.%ld", filepath, asi_getpid());
     if (tn <= 0 || (size_t)tn >= tcap) { free(tmp_path); return -1; }
 
     FILE *fp = fopen(tmp_path, "wb");
@@ -2114,19 +2200,18 @@ static int dense_save_prefix_file(const AsiArchSession *session,
         fwrite(s->prefix_k, 1, (size_t)kv_bytes, fp) != (size_t)kv_bytes ||
         fwrite(s->prefix_v, 1, (size_t)kv_bytes, fp) != (size_t)kv_bytes)
     {
-        fclose(fp); unlink(tmp_path); free(tmp_path);
+        fclose(fp); asi_unlink(tmp_path); free(tmp_path);
         return -1;
     }
-    if (fflush(fp) != 0) { fclose(fp); unlink(tmp_path); free(tmp_path); return -1; }
-    int fd = fileno(fp);
-    if (fd >= 0 && fsync(fd) != 0 && errno != EINVAL && errno != EROFS)
+    if (fflush(fp) != 0) { fclose(fp); asi_unlink(tmp_path); free(tmp_path); return -1; }
+    if (asi_fsync_file(fp) != 0)
     {
-        fclose(fp); unlink(tmp_path); free(tmp_path);
+        fclose(fp); asi_unlink(tmp_path); free(tmp_path);
         return -1;
     }
-    if (fclose(fp) != 0 || rename(tmp_path, filepath) != 0)
+    if (fclose(fp) != 0 || asi_atomic_rename(tmp_path, filepath) != 0)
     {
-        unlink(tmp_path); free(tmp_path);
+        asi_unlink(tmp_path); free(tmp_path);
         return -1;
     }
     free(tmp_path);

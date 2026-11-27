@@ -116,6 +116,24 @@ LilaLhcIndex *lila_lhc_build_q6k(LilaLhcMode mode,
                                  uint32_t hidden_size,
                                  const float *output_norm);
 
+/* Zero-copy load of pre-serialized ASI_SEC_SIEVE_SKETCH (0x11) section.
+ * Validates AsiSieveSketchHeader, alignment, and exact bounds; pointers alias sec_data directly.
+ * Returns NULL cleanly on mismatch or corruption so caller can fall back to on-the-fly build. */
+LilaLhcIndex *lila_lhc_from_serialized(LilaLhcMode expected_mode,
+                                       const uint8_t *sec_data,
+                                       size_t sec_size,
+                                       uint32_t quant_type,
+                                       int is_repacked,
+                                       uint32_t vocab_size,
+                                       uint32_t hidden_size);
+
+/* Serialize a built LilaLhcIndex into ASI_SEC_SIEVE_SKETCH binary section layout.
+ * Pass out_buf == NULL to query required byte count in *out_written. */
+int lila_lhc_serialize_section(const LilaLhcIndex *index,
+                                 uint8_t *out_buf,
+                                 size_t out_cap,
+                                 size_t *out_written);
+
 uint32_t lila_lhc_quant_type(const LilaLhcIndex *index);
 int lila_lhc_is_repacked(const LilaLhcIndex *index);
 

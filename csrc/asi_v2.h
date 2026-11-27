@@ -10,6 +10,7 @@
  *   - Lila Host Application (Core, Harness, OIA, vTalks, Island)
  */
 
+#include "asi_platform.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -41,19 +42,45 @@ typedef enum {
     ASI_SEC_ADAPTERS      = 0x0C,
     ASI_SEC_RUNTIME_HINTS = 0x0D,
     ASI_SEC_SIGNATURE     = 0x0E,
+    ASI_SEC_GRAPH         = 0x0F, /* Declarative universal computation graph */
+    ASI_SEC_PAIRING       = 0x10, /* Immutable-base sealed neural pairing bridge (V8) */
+    ASI_SEC_SIEVE_SKETCH  = 0x11, /* Pre-serialized zero-copy Sieve sketch (E07/v2.6) */
 } AsiV2SectionType;
 
+#define ASI_SIEVE_MAGIC "ASISV01"
+
+/* 64-byte header at start of ASI_SEC_SIEVE_SKETCH (0x11) payload */
+typedef struct {
+    char     magic[8];      /* "ASISV01\0" */
+    uint32_t mode;          /* LilaLhcMode */
+    uint32_t vocab_size;
+    uint32_t hidden_size;
+    uint32_t n_tiles;
+    uint32_t quant_type;
+    uint32_t is_repacked;
+    uint64_t sketch_offset; /* 64-byte aligned offset from start of section */
+    uint64_t sketch_bytes;
+    uint64_t scales_offset; /* 64-byte aligned offset from start of section */
+    uint64_t scales_bytes;
+} AsiSieveSketchHeader;
+
+_Static_assert(sizeof(AsiSieveSketchHeader) == 64, "AsiSieveSketchHeader must be 64 bytes");
+
 typedef enum {
-    ASI_QUANT_F32     = 0,
-    ASI_QUANT_FIGINT4 = 1,
-    ASI_QUANT_Q4_K    = 2,
-    ASI_QUANT_Q6_K    = 3,
-    ASI_QUANT_F16     = 4,
-    ASI_QUANT_Q8_0    = 5,
+    ASI_QUANT_F32         = 0,
+    ASI_QUANT_FIGINT4     = 1,
+    ASI_QUANT_Q4_K        = 2,
+    ASI_QUANT_Q6_K        = 3,
+    ASI_QUANT_F16         = 4,
+    ASI_QUANT_Q8_0        = 5,
+    /* ASI-native E07/v2.6 quant types (IDs >= 100 stay clear of GGML types 0..39) */
+    ASI_QUANT_Q4_REPACK   = 100, /* 4-bit AVX2-repacked group-64 (4.25 bpw: 2B fp16 + 32B nibbles) */
+    ASI_QUANT_Q3_SPLITLUT = 101, /* 3-bit split-plane vpshufb LUT 64-row tile (3.125 bpw, opt-in) */
 } AsiV2QuantType;
 
 #define ASI_TENSOR_LAYOUT_ROW_MAJOR   (1u << 0)
 #define ASI_TENSOR_LAYOUT_AVX2_REPACK (1u << 1)
+#define ASI_TENSOR_LAYOUT_COL_MAJOR   (1u << 2)
 
 #define ASI_V2_FLAG_HAS_VISION        (1u << 0)
 #define ASI_V2_FLAG_HAS_AUDIO         (1u << 1)
@@ -147,13 +174,47 @@ typedef struct {
     size_t                   weights_data_size;
 } AsiV2Cartridge;
 
-uint64_t asi_v2_crc64(const uint8_t *data, size_t len);
-int asi_v2_validate_memory(const uint8_t *data, size_t size, AsiV2Cartridge *out,
-                           char *err_buf, size_t err_cap);
-int asi_v2_open(const char *path, AsiV2Cartridge *out, char *err_buf, size_t err_cap);
-void asi_v2_close(AsiV2Cartridge *cart);
-const AsiV2SectionEntry *asi_v2_find_section(const AsiV2Cartridge *cart, uint32_t type);
-const AsiV2TensorEntry *asi_v2_find_tensor(const AsiV2Cartridge *cart, const char *name);
-const char *asi_v2_arch_name(uint32_t arch_id);
+#define ASI_SIG_MAGIC        "ASISIG1"
+#define ASI_SIG_VERSION      1u
+#define ASI_SIG_ALG_ED25519  1u
+
+/* 144-byte cryptographic signature payload inside ASI_SEC_SIGNATURE (0x0E) */
+typedef struct {
+    char     magic[8];          /* "ASISIG1\0" */
+    uint32_t version;           /* 1 */
+    uint32_t alg_id;            /* 1 = Ed25519 over canonical SHA-256 manifest */
+    uint64_t signed_at_unix;
+    char     publisher[24];     /* NUL-padded UTF-8 publisher identifier */
+    uint8_t  public_key[32];    /* Ed25519 public key */
+    uint8_t  signature[64];     /* Ed25519 signature over 32-byte signing digest */
+} AsiV2SignatureBlock;
+
+_Static_assert(sizeof(AsiV2SignatureBlock) == 144, "AsiV2SignatureBlock must be 144 bytes");
+
+typedef struct {
+    int      valid;
+    uint32_t alg_id;
+    uint64_t signed_at_unix;
+    char     publisher[25];
+    uint8_t  public_key[32];
+} AsiV2SignatureInfo;
+
+ASI_API uint64_t asi_v2_crc64(const uint8_t *data, size_t len);
+ASI_API int asi_v2_validate_memory(const uint8_t *data, size_t size, AsiV2Cartridge *out,
+                                   char *err_buf, size_t err_cap);
+ASI_API int asi_v2_open(const char *path, AsiV2Cartridge *out, char *err_buf, size_t err_cap);
+ASI_API void asi_v2_close(AsiV2Cartridge *cart);
+ASI_API const AsiV2SectionEntry *asi_v2_find_section(const AsiV2Cartridge *cart, uint32_t type);
+ASI_API const AsiV2TensorEntry *asi_v2_find_tensor(const AsiV2Cartridge *cart, const char *name);
+ASI_API const char *asi_v2_arch_name(uint32_t arch_id);
+
+ASI_API int asi_v2_compute_signing_digest(const AsiV2Cartridge *cart,
+                                          const AsiV2SignatureBlock *sig_blk,
+                                          uint8_t out_digest[32]);
+ASI_API int asi_v2_verify_signature(const AsiV2Cartridge *cart,
+                                    const uint8_t *trusted_pubkey_32,
+                                    AsiV2SignatureInfo *out_info,
+                                    char *err_buf,
+                                    size_t err_cap);
 
 #endif /* LILA_ASI_V2_H */

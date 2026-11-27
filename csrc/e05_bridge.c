@@ -3,6 +3,7 @@
 #endif
 
 #include "asi_grammar_sparse.h"
+#include "asi_platform.h"
 #include "asi_v2.h"
 #include "lila_asi.h"
 #include "lila_lm_head_candidate.h"
@@ -10,12 +11,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 static inline double e05_now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec * 1e-6;
+    return (double)asi_monotonic_ns() * 1e-6;
 }
 
 extern int lila_lhc_forward_pool_raw(const LilaLhcIndex *index,

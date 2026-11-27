@@ -1,11 +1,12 @@
 cmake_minimum_required(VERSION 3.18)
-project(lila_asi VERSION 2.4.0 LANGUAGES C)
+project(lila_asi VERSION 2.6.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(LILA_ASI_SOURCES
+    asi_ed25519.c
     asi_v2.c
     asi_arch.c
     asi_dense.c
@@ -14,6 +15,10 @@ set(LILA_ASI_SOURCES
     asi_grammar_sparse.c
     e05_bridge.c
     asi_state_centric.c
+    asi_kernels.c
+    asi_graph.c
+    asi_pairing.c
+    asi_vision.c
     lila_asi_mobile_jni.c
 )
 

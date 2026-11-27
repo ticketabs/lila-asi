@@ -104,58 +104,58 @@ typedef struct {
 } AsiCowStats;
 
 /* Multi-slot checkpoint fork / restore / delete / save_file / load_file */
-int lila_asi_cp_fork(LilaAsiSession *session,
-                     uint32_t n_tokens,
-                     uint64_t rng_state,
-                     const char *label,
-                     uint32_t *out_cp_id);
+ASI_API int lila_asi_cp_fork(LilaAsiSession *session,
+                             uint32_t n_tokens,
+                             uint64_t rng_state,
+                             const char *label,
+                             uint32_t *out_cp_id);
 
-int lila_asi_cp_restore(LilaAsiSession *session,
-                        uint32_t cp_id,
-                        uint32_t *out_n_tokens,
-                        uint64_t *out_rng_state);
+ASI_API int lila_asi_cp_restore(LilaAsiSession *session,
+                                uint32_t cp_id,
+                                uint32_t *out_n_tokens,
+                                uint64_t *out_rng_state);
 
-int lila_asi_cp_delete(LilaAsiSession *session, uint32_t cp_id);
+ASI_API int lila_asi_cp_delete(LilaAsiSession *session, uint32_t cp_id);
 
-int lila_asi_cp_save_file(const LilaAsiSession *session,
-                          uint32_t cp_id,
-                          const uint8_t key_hash[32],
-                          const char *filepath);
+ASI_API int lila_asi_cp_save_file(const LilaAsiSession *session,
+                                  uint32_t cp_id,
+                                  const uint8_t key_hash[32],
+                                  const char *filepath);
 
-int lila_asi_cp_load_file(LilaAsiSession *session,
-                          const uint8_t expected_key_hash[32],
-                          const char *filepath,
-                          const char *label,
-                          uint32_t *out_cp_id);
+ASI_API int lila_asi_cp_load_file(LilaAsiSession *session,
+                                  const uint8_t expected_key_hash[32],
+                                  const char *filepath,
+                                  const char *label,
+                                  uint32_t *out_cp_id);
 
 /* Provenance inspection & explicit commit / abandon lifecycle */
-int lila_asi_cp_get_info(const LilaAsiSession *session,
-                         uint32_t cp_id,
-                         AsiCheckpointInfo *out_info);
+ASI_API int lila_asi_cp_get_info(const LilaAsiSession *session,
+                                 uint32_t cp_id,
+                                 AsiCheckpointInfo *out_info);
 
-int lila_asi_session_get_provenance(const LilaAsiSession *session,
-                                    AsiBranchProvenance *out_prov);
+ASI_API int lila_asi_session_get_provenance(const LilaAsiSession *session,
+                                            AsiBranchProvenance *out_prov);
 
 /*
  * Commit a checkpoint branch. Returns -1 if cp_id is ABANDONED (prevents
  * rolled-back branches from ever silently leaking into committed state).
  */
-int lila_asi_cp_commit(LilaAsiSession *session, uint32_t cp_id);
+ASI_API int lila_asi_cp_commit(LilaAsiSession *session, uint32_t cp_id);
 
 /* Explicitly mark a checkpoint branch as ABANDONED. */
-int lila_asi_cp_abandon(LilaAsiSession *session, uint32_t cp_id);
+ASI_API int lila_asi_cp_abandon(LilaAsiSession *session, uint32_t cp_id);
 
 /* Query Copy-on-Write KV page sharing stats for the session's State Tree. */
-int lila_asi_cp_cow_stats(const LilaAsiSession *session, AsiCowStats *out_stats);
+ASI_API int lila_asi_cp_cow_stats(const LilaAsiSession *session, AsiCowStats *out_stats);
 
 /*
  * Compute a SHA-256 digest over the live session's raw DeltaNet (conv + ssm)
  * and FP16 KV cache bytes for tokens [0..n_tokens-1]. Used for exact
  * cross-branch zero-pollution verification.
  */
-int lila_asi_session_state_sha256(const LilaAsiSession *session,
-                                  uint32_t n_tokens,
-                                  uint8_t out_sha256[32]);
+ASI_API int lila_asi_session_state_sha256(const LilaAsiSession *session,
+                                          uint32_t n_tokens,
+                                          uint8_t out_sha256[32]);
 
 /* =========================================================================
  * 2. Crash-Recoverable Session WAL (over atomic ASITREE1 checkpoints)
@@ -172,26 +172,26 @@ typedef struct {
     uint32_t corrupt_tail_records_ignored;
 } AsiWalResumeInfo;
 
-LilaAsiWal *lila_asi_wal_open(const char *wal_dir,
-                              const char *session_id,
-                              const uint8_t key_hash[32]);
+ASI_API LilaAsiWal *lila_asi_wal_open(const char *wal_dir,
+                                      const char *session_id,
+                                      const uint8_t key_hash[32]);
 
-void lila_asi_wal_close(LilaAsiWal *wal);
+ASI_API void lila_asi_wal_close(LilaAsiWal *wal);
 
 /* Fork + atomically save ASITREE1 checkpoint file + durably fsync WAL record. */
-int lila_asi_wal_checkpoint(LilaAsiWal *wal,
-                            LilaAsiSession *session,
-                            uint32_t n_tokens,
-                            uint64_t rng_state,
-                            const char *label,
-                            uint32_t *out_cp_id);
+ASI_API int lila_asi_wal_checkpoint(LilaAsiWal *wal,
+                                    LilaAsiSession *session,
+                                    uint32_t n_tokens,
+                                    uint64_t rng_state,
+                                    const char *label,
+                                    uint32_t *out_cp_id);
 
 /* Durably append tail tokens + exact post-step uint64_t rng_state to WAL. */
-int lila_asi_wal_append_tokens(LilaAsiWal *wal,
-                               uint32_t base_cp_id,
-                               const int32_t *token_ids,
-                               uint32_t n_tokens,
-                               uint64_t rng_state);
+ASI_API int lila_asi_wal_append_tokens(LilaAsiWal *wal,
+                                       uint32_t base_cp_id,
+                                       const int32_t *token_ids,
+                                       uint32_t n_tokens,
+                                       uint64_t rng_state);
 
 /*
  * Recover from WAL into a fresh (or reset) session:
@@ -201,10 +201,10 @@ int lila_asi_wal_append_tokens(LilaAsiWal *wal,
  *      into out_last_logits if non-NULL and tail > 0).
  *   4. Return exact restored uint64_t rng_state and token counts.
  */
-int lila_asi_wal_resume(LilaAsiWal *wal,
-                        LilaAsiSession *session,
-                        float *out_last_logits,
-                        AsiWalResumeInfo *out_info);
+ASI_API int lila_asi_wal_resume(LilaAsiWal *wal,
+                                LilaAsiSession *session,
+                                float *out_last_logits,
+                                AsiWalResumeInfo *out_info);
 
 /* =========================================================================
  * 3. C11 Confidence API (lila_asi_sample_ex)
@@ -224,16 +224,16 @@ typedef struct {
  * Extended sampler returning identical token_id as lila_asi_sample while
  * populating exact top1/top2/margin/top1_logprob/entropy in out_stats.
  */
-int32_t lila_asi_sample_ex(const float *logits,
-                           uint32_t vocab_size,
-                           float temperature,
-                           uint32_t top_k,
-                           float top_p,
-                           uint64_t *rng_state,
-                           AsiSampleStats *out_stats);
+ASI_API int32_t lila_asi_sample_ex(const float *logits,
+                                   uint32_t vocab_size,
+                                   float temperature,
+                                   uint32_t top_k,
+                                   float top_p,
+                                   uint64_t *rng_state,
+                                   AsiSampleStats *out_stats);
 
 /* Standalone SHA-256 helper exposed for verification tests */
-void lila_asi_sha256(const void *data, size_t len, uint8_t out_hash[32]);
+ASI_API void lila_asi_sha256(const void *data, size_t len, uint8_t out_hash[32]);
 
 #ifdef __cplusplus
 }

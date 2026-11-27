@@ -59,6 +59,23 @@ typedef struct {
                                int32_t token_id,
                                uint32_t pos,
                                float *out_logits);
+
+    /* Optional multimodal FP32 embedding forward pass with 3-axis M-RoPE. */
+    int (*forward_embd)(AsiArchSession *session,
+                        const float *embds,
+                        uint32_t n_tokens,
+                        uint32_t kv_pos_start,
+                        const uint32_t *mrope_pos_3d,
+                        const uint32_t mrope_sections[3],
+                        uint32_t mrope_flags,
+                        uint32_t next_rope_pos,
+                        const volatile int *cancel_flag,
+                        float *out_last_logits);
+    int64_t (*get_rope_delta)(const AsiArchSession *session);
+    void (*set_rope_delta)(AsiArchSession *session, int64_t delta);
+    void (*set_calib_hook)(AsiArchSession *session,
+                           void (*fn)(void *, uint32_t, int, const float *, uint32_t, uint32_t),
+                           void *user_ctx);
 } AsiArchHandler;
 
 /* Lookup a registered architecture handler by AsiV2ArchId. Returns NULL if unsupported. */
