@@ -3358,7 +3358,7 @@ typedef struct {
 static inline int asi_chunkwy_enabled(void)
 {
     const char *e = getenv("LILA_ASI_CHUNKWY");
-    return (!e || e[0] != '0') ? 1 : 0;
+    return (e && e[0] == '1') ? 1 : 0;
 }
 
 static void asi_sgemm_rm(int M, int N, int K,
@@ -3471,16 +3471,17 @@ static int asi_deltanet_wy_chunk(AsiDeltaNetWyBuf *wb,
     int C = (int)nt;
     int Kd = (int)k_dim;
     int Vd = (int)v_dim;
-    float L[32], Gamma[32];
-    float acc_log = 0.0f;
+    double L[32];
+    float Gamma[32];
+    double acc_log = 0.0;
     for (int i = 0; i < C; ++i)
     {
-        acc_log += log_g_arr[i];
+        acc_log += (double)log_g_arr[i];
         if (!isfinite(acc_log)) return -1;
         L[i] = acc_log;
-        Gamma[i] = expf(acc_log);
+        Gamma[i] = (float)exp(acc_log);
     }
-    float L_end = L[C - 1];
+    double L_end = L[C - 1];
     float Gamma_end = Gamma[C - 1];
 
     for (int j = 0; j < C; ++j)
@@ -3509,10 +3510,10 @@ static int asi_deltanet_wy_chunk(AsiDeltaNetWyBuf *wb,
     {
         wb->Linv[i * C + i] = 1.0f;
         float bi = beta_arr[i];
-        float li = L[i];
+        double li = L[i];
         for (int k = 0; k < i; ++k)
         {
-            float mik = bi * expf(li - L[k]) * wb->Gkk[i * C + k];
+            float mik = bi * expf((float)(li - L[k])) * wb->Gkk[i * C + k];
             for (int j = 0; j <= k; ++j)
                 wb->Linv[i * C + j] -= mik * wb->Linv[k * C + j];
         }
@@ -3522,18 +3523,18 @@ static int asi_deltanet_wy_chunk(AsiDeltaNetWyBuf *wb,
     for (int i = 0; i < C; ++i)
     {
         float gi = Gamma[i];
-        float li = L[i];
+        double li = L[i];
         const float *oi = wb->O_inter + (size_t)i * Vd;
         float *oo = O_tile + (size_t)i * Vd;
         for (int d = 0; d < Vd; ++d) oo[d] = gi * oi[d];
         for (int j = 0; j < C; ++j)
-            wb->A_mat[i * C + j] = (j <= i) ? (expf(li - L[j]) * wb->Gqk[i * C + j]) : 0.0f;
+            wb->A_mat[i * C + j] = (j <= i) ? (expf((float)(li - L[j])) * wb->Gqk[i * C + j]) : 0.0f;
     }
     asi_sgemm_rm(C, Vd, C, wb->A_mat, C, wb->U, Vd, 1.0f, O_tile, Vd);
 
     for (int j = 0; j < C; ++j)
     {
-        float sc = expf(L_end - L[j]);
+        float sc = expf((float)(L_end - L[j]));
         for (int k = 0; k < Kd; ++k) wb->KT[(size_t)k * C + j] *= sc;
     }
     asi_sgemm_rm(Kd, Vd, C, wb->KT, C, wb->U, Vd, Gamma_end, wb->S_T, Vd);

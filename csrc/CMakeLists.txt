@@ -19,6 +19,7 @@ set(LILA_ASI_SOURCES
     asi_graph.c
     asi_pairing.c
     asi_vision.c
+    asi_mcu.c
     lila_asi_mobile_jni.c
 )
 
@@ -39,8 +40,8 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     endif()
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     if(NOT MSVC)
-        target_compile_options(lila_asi PRIVATE -O3)
-        target_compile_options(lila_asi_static PRIVATE -O3)
+        target_compile_options(lila_asi PRIVATE -O3 -march=armv8.2-a+dotprod+fp16)
+        target_compile_options(lila_asi_static PRIVATE -O3 -march=armv8.2-a+dotprod+fp16)
     endif()
 endif()
 

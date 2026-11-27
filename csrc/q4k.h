@@ -47,6 +47,10 @@
 static inline float fp16_to_fp32(uint16_t h) {
 #if defined(__F16C__)
     return _cvtsh_ss(h);
+#elif defined(__aarch64__) && (defined(__ARM_FP16_FORMAT_IEEE) || defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC))
+    __fp16 hf;
+    memcpy(&hf, &h, 2);
+    return (float)hf;
 #else
     uint32_t sign = ((uint32_t)(h & 0x8000u)) << 16;
     uint32_t exp = (h >> 10) & 0x1F;
@@ -80,6 +84,11 @@ static inline float fp16_to_fp32(uint16_t h) {
 static inline uint16_t fp32_to_fp16(float f) {
 #if defined(__F16C__)
     return _cvtss_sh(f, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+#elif defined(__aarch64__) && (defined(__ARM_FP16_FORMAT_IEEE) || defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC))
+    __fp16 hf = (__fp16)f;
+    uint16_t h;
+    memcpy(&h, &hf, 2);
+    return h;
 #else
     uint32_t x;
     memcpy(&x, &f, 4);
@@ -2453,6 +2462,30 @@ static inline float lila_fp32_dot_slice(const float *w, const float *x, int n) {
     float s = lila_hsum_f32_avx2(_mm256_add_ps(acc0, acc1));
     for (; j < n; j++) s += w[j] * x[j];
     return s;
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f);
+    float32x4_t acc3 = vdupq_n_f32(0.0f);
+    int j = 0;
+    for (; j + 15 < n; j += 16) {
+        acc0 = vfmaq_f32(acc0, vld1q_f32(w + j + 0), vld1q_f32(x + j + 0));
+        acc1 = vfmaq_f32(acc1, vld1q_f32(w + j + 4), vld1q_f32(x + j + 4));
+        acc2 = vfmaq_f32(acc2, vld1q_f32(w + j + 8), vld1q_f32(x + j + 8));
+        acc3 = vfmaq_f32(acc3, vld1q_f32(w + j + 12), vld1q_f32(x + j + 12));
+    }
+    acc0 = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+    for (; j + 3 < n; j += 4) {
+        acc0 = vfmaq_f32(acc0, vld1q_f32(w + j), vld1q_f32(x + j));
+    }
+#if defined(__aarch64__)
+    float s = vaddvq_f32(acc0);
+#else
+    float32x2_t p2 = vadd_f32(vget_low_f32(acc0), vget_high_f32(acc0));
+    float s = vget_lane_f32(vpadd_f32(p2, p2), 0);
+#endif
+    for (; j < n; j++) s += w[j] * x[j];
+    return s;
 #else
     float s = 0.0f;
     for (int j = 0; j < n; j++) s += w[j] * x[j];
@@ -3133,25 +3166,27 @@ static inline void q4_repack_col_major_matvec_range(float *out,
     const int32x4_t v8_n   = vdupq_n_s32(8);
 #endif
 
-    for (int rb = rb_start; rb <= rb_end; ++rb) {
-        int r0 = rb * Q4_REPACK_GROUP_SIZE;
-        int full_blk = (r0 >= row_start && r0 + Q4_REPACK_GROUP_SIZE <= row_end);
-        size_t blk_off = (size_t)rb * Q4_REPACK_BLOCK_SIZE;
+    for (int ki = 0; ki < k_count; ++ki) {
+        int c = active_cols ? (int)active_cols[ki] : ki;
+        float xv = in[c];
+        if (xv == 0.0f) continue;
+        const uint8_t *col_ptr = w + (size_t)c * col_bytes;
+        if (ki + 1 < k_count) {
+            int cn = active_cols ? (int)active_cols[ki + 1] : (ki + 1);
+            LILA_PREFETCH(w + (size_t)cn * col_bytes + (size_t)rb_start * Q4_REPACK_BLOCK_SIZE);
+        }
 
-        if (full_blk) {
+        for (int rb = rb_start; rb <= rb_end; ++rb) {
+            int r0 = rb * Q4_REPACK_GROUP_SIZE;
+            int full_blk = (r0 >= row_start && r0 + Q4_REPACK_GROUP_SIZE <= row_end);
+            const uint8_t *bp = col_ptr + (size_t)rb * Q4_REPACK_BLOCK_SIZE;
+            uint16_t d_raw;
+            memcpy(&d_raw, bp, 2);
+            float scale_x = fp16_to_fp32(d_raw) * xv;
+
+            if (full_blk) {
 #if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
-            __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
-            __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
-            __m256 a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps();
-            __m256 a6 = _mm256_setzero_ps(), a7 = _mm256_setzero_ps();
-            for (int ki = 0; ki < k_count; ++ki) {
-                int c = active_cols ? (int)active_cols[ki] : ki;
-                float xv = in[c];
-                if (xv == 0.0f) continue;
-                const uint8_t *bp = w + (size_t)c * col_bytes + blk_off;
-                uint16_t d_raw;
-                memcpy(&d_raw, bp, 2);
-                __m256 sv = _mm256_set1_ps(_cvtsh_ss(d_raw) * xv);
+                __m256 sv = _mm256_set1_ps(scale_x);
                 __m256i q = _mm256_loadu_si256((const __m256i *)(bp + 2));
                 __m256i qlo = _mm256_and_si256(q, m0f);
                 __m256i qhi = _mm256_and_si256(_mm256_srli_epi16(q, 4), m0f);
@@ -3159,30 +3194,18 @@ static inline void q4_repack_col_major_matvec_range(float *out,
                 __m128i lo1 = _mm256_extracti128_si256(qlo, 1);
                 __m128i hi0 = _mm256_castsi256_si128(qhi);
                 __m128i hi1 = _mm256_extracti128_si256(qhi, 1);
-                a0 = _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(lo0), v8)), a0);
-                a1 = _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(lo0, 8)), v8)), a1);
-                a2 = _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(lo1), v8)), a2);
-                a3 = _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(lo1, 8)), v8)), a3);
-                a4 = _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(hi0), v8)), a4);
-                a5 = _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(hi0, 8)), v8)), a5);
-                a6 = _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(hi1), v8)), a6);
-                a7 = _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(hi1, 8)), v8)), a7);
-            }
-            _mm256_storeu_ps(out + r0 +  0, a0); _mm256_storeu_ps(out + r0 +  8, a1);
-            _mm256_storeu_ps(out + r0 + 16, a2); _mm256_storeu_ps(out + r0 + 24, a3);
-            _mm256_storeu_ps(out + r0 + 32, a4); _mm256_storeu_ps(out + r0 + 40, a5);
-            _mm256_storeu_ps(out + r0 + 48, a6); _mm256_storeu_ps(out + r0 + 56, a7);
+                float *op = out + r0;
+                _mm256_storeu_ps(op +  0, _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(lo0), v8)), _mm256_loadu_ps(op +  0)));
+                _mm256_storeu_ps(op +  8, _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(lo0, 8)), v8)), _mm256_loadu_ps(op +  8)));
+                _mm256_storeu_ps(op + 16, _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(lo1), v8)), _mm256_loadu_ps(op + 16)));
+                _mm256_storeu_ps(op + 24, _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(lo1, 8)), v8)), _mm256_loadu_ps(op + 24)));
+                _mm256_storeu_ps(op + 32, _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(hi0), v8)), _mm256_loadu_ps(op + 32)));
+                _mm256_storeu_ps(op + 40, _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(hi0, 8)), v8)), _mm256_loadu_ps(op + 40)));
+                _mm256_storeu_ps(op + 48, _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(hi1), v8)), _mm256_loadu_ps(op + 48)));
+                _mm256_storeu_ps(op + 56, _mm256_fmadd_ps(sv, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(hi1, 8)), v8)), _mm256_loadu_ps(op + 56)));
 #elif defined(__ARM_NEON)
-            float32x4_t acc[16];
-            for (int v = 0; v < 16; ++v) acc[v] = vdupq_n_f32(0.0f);
-            for (int ki = 0; ki < k_count; ++ki) {
-                int c = active_cols ? (int)active_cols[ki] : ki;
-                float xv = in[c];
-                if (xv == 0.0f) continue;
-                const uint8_t *bp = w + (size_t)c * col_bytes + blk_off;
-                uint16_t d_raw;
-                memcpy(&d_raw, bp, 2);
-                float32x4_t sv = vdupq_n_f32(fp16_to_fp32(d_raw) * xv);
+                float32x4_t sv = vdupq_n_f32(scale_x);
+                float *op = out + r0;
                 for (int h = 0; h < 2; ++h) {
                     uint8x16_t q = vld1q_u8(bp + 2 + h * 16);
                     uint8x16_t qlo = vandq_u8(q, m0f_n);
@@ -3193,56 +3216,33 @@ static inline void q4_repack_col_major_matvec_range(float *out,
                     uint16x8_t hi16_1 = vmovl_u8(vget_high_u8(qhi));
                     int ob_lo = h * 4;
                     int ob_hi = 8 + h * 4;
-                    acc[ob_lo + 0] = vmlaq_f32(acc[ob_lo + 0], sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(lo16_0))),  v8_n)));
-                    acc[ob_lo + 1] = vmlaq_f32(acc[ob_lo + 1], sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(lo16_0))), v8_n)));
-                    acc[ob_lo + 2] = vmlaq_f32(acc[ob_lo + 2], sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(lo16_1))),  v8_n)));
-                    acc[ob_lo + 3] = vmlaq_f32(acc[ob_lo + 3], sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(lo16_1))), v8_n)));
-                    acc[ob_hi + 0] = vmlaq_f32(acc[ob_hi + 0], sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(hi16_0))),  v8_n)));
-                    acc[ob_hi + 1] = vmlaq_f32(acc[ob_hi + 1], sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(hi16_0))), v8_n)));
-                    acc[ob_hi + 2] = vmlaq_f32(acc[ob_hi + 2], sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(hi16_1))),  v8_n)));
-                    acc[ob_hi + 3] = vmlaq_f32(acc[ob_hi + 3], sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(hi16_1))), v8_n)));
+                    vst1q_f32(op + (ob_lo + 0) * 4, vmlaq_f32(vld1q_f32(op + (ob_lo + 0) * 4), sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(lo16_0))),  v8_n))));
+                    vst1q_f32(op + (ob_lo + 1) * 4, vmlaq_f32(vld1q_f32(op + (ob_lo + 1) * 4), sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(lo16_0))), v8_n))));
+                    vst1q_f32(op + (ob_lo + 2) * 4, vmlaq_f32(vld1q_f32(op + (ob_lo + 2) * 4), sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(lo16_1))),  v8_n))));
+                    vst1q_f32(op + (ob_lo + 3) * 4, vmlaq_f32(vld1q_f32(op + (ob_lo + 3) * 4), sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(lo16_1))), v8_n))));
+                    vst1q_f32(op + (ob_hi + 0) * 4, vmlaq_f32(vld1q_f32(op + (ob_hi + 0) * 4), sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(hi16_0))),  v8_n))));
+                    vst1q_f32(op + (ob_hi + 1) * 4, vmlaq_f32(vld1q_f32(op + (ob_hi + 1) * 4), sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(hi16_0))), v8_n))));
+                    vst1q_f32(op + (ob_hi + 2) * 4, vmlaq_f32(vld1q_f32(op + (ob_hi + 2) * 4), sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(hi16_1))),  v8_n))));
+                    vst1q_f32(op + (ob_hi + 3) * 4, vmlaq_f32(vld1q_f32(op + (ob_hi + 3) * 4), sv, vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(hi16_1))), v8_n))));
                 }
-            }
-            for (int v = 0; v < 16; ++v) vst1q_f32(out + r0 + v * 4, acc[v]);
 #else
-            float acc[Q4_REPACK_GROUP_SIZE];
-            memset(acc, 0, sizeof(acc));
-            for (int ki = 0; ki < k_count; ++ki) {
-                int c = active_cols ? (int)active_cols[ki] : ki;
-                float xv = in[c];
-                if (xv == 0.0f) continue;
-                const uint8_t *bp = w + (size_t)c * col_bytes + blk_off;
-                uint16_t d_raw;
-                memcpy(&d_raw, bp, 2);
-                float sv = fp16_to_fp32(d_raw) * xv;
                 const uint8_t *qs = bp + 2;
+                float *op = out + r0;
                 for (int l = 0; l < 32; ++l) {
-                    acc[l]      += sv * (float)((int)(qs[l] & 0x0Fu) - 8);
-                    acc[l + 32] += sv * (float)((int)(qs[l] >> 4) - 8);
+                    op[l]      += scale_x * (float)((int)(qs[l] & 0x0Fu) - 8);
+                    op[l + 32] += scale_x * (float)((int)(qs[l] >> 4) - 8);
                 }
-            }
-            memcpy(out + r0, acc, sizeof(acc));
 #endif
-        } else {
-            float acc[Q4_REPACK_GROUP_SIZE];
-            memset(acc, 0, sizeof(acc));
-            for (int ki = 0; ki < k_count; ++ki) {
-                int c = active_cols ? (int)active_cols[ki] : ki;
-                float xv = in[c];
-                if (xv == 0.0f) continue;
-                const uint8_t *bp = w + (size_t)c * col_bytes + blk_off;
-                uint16_t d_raw;
-                memcpy(&d_raw, bp, 2);
-                float sv = fp16_to_fp32(d_raw) * xv;
+            } else {
                 const uint8_t *qs = bp + 2;
-                for (int l = 0; l < 32; ++l) {
-                    acc[l]      += sv * (float)((int)(qs[l] & 0x0Fu) - 8);
-                    acc[l + 32] += sv * (float)((int)(qs[l] >> 4) - 8);
+                int c_lo = (row_start > r0) ? row_start : r0;
+                int c_hi = (row_end < r0 + Q4_REPACK_GROUP_SIZE) ? row_end : (r0 + Q4_REPACK_GROUP_SIZE);
+                for (int r = c_lo; r < c_hi; ++r) {
+                    int lr = r - r0;
+                    int qval = (lr < 32) ? (int)(qs[lr] & 0x0Fu) : (int)(qs[lr - 32] >> 4);
+                    out[r] += scale_x * (float)(qval - 8);
                 }
             }
-            int c_lo = (row_start > r0) ? row_start : r0;
-            int c_hi = (row_end < r0 + Q4_REPACK_GROUP_SIZE) ? row_end : (r0 + Q4_REPACK_GROUP_SIZE);
-            for (int r = c_lo; r < c_hi; ++r) out[r] = acc[r - r0];
         }
     }
 }
@@ -3648,6 +3648,15 @@ static inline float lila_quant_dot_fp32(const uint8_t *row_blocks, const float *
             }
             total = lila_hsum_f32_avx2(acc);
         }
+#elif defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        for (; j + 3 < cols; j += 4) {
+            uint16x4_t h4 = vld1_u16((const uint16_t *)(row_blocks + (size_t)j * 2u));
+            float32x4_t wv = vcvt_f32_f16(vreinterpret_f16_u16(h4));
+            float32x4_t xv = vld1q_f32(x + j);
+            acc = vfmaq_f32(acc, wv, xv);
+        }
+        total = vaddvq_f32(acc);
 #endif
         for (; j < cols; ++j) {
             uint16_t bits;
@@ -3670,6 +3679,20 @@ static inline float lila_quant_dot_fp32(const uint8_t *row_blocks, const float *
             }
             total = lila_hsum_f32_avx2(acc);
         }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        for (; j + 3 < cols; j += 4) {
+            uint16x4_t b4 = vld1_u16((const uint16_t *)(row_blocks + (size_t)j * 2u));
+            float32x4_t wv = vreinterpretq_f32_u32(vshlq_n_u32(vmovl_u16(b4), 16));
+            float32x4_t xv = vld1q_f32(x + j);
+            acc = vfmaq_f32(acc, wv, xv);
+        }
+#  if defined(__aarch64__)
+        total = vaddvq_f32(acc);
+#  else
+        float32x2_t s2 = vadd_f32(vget_low_f32(acc), vget_high_f32(acc));
+        total = vget_lane_f32(vpadd_f32(s2, s2), 0);
+#  endif
 #endif
         for (; j < cols; ++j) {
             uint16_t bits;
@@ -3700,6 +3723,28 @@ static inline float lila_quant_dot_fp32(const uint8_t *row_blocks, const float *
                     acc = _mm256_fmadd_ps(wf, xf, acc);
                 }
                 total += d * lila_hsum_f32_avx2(acc);
+                continue;
+            }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+            if (n == 32) {
+                float32x4_t acc0 = vdupq_n_f32(0.0f);
+                float32x4_t acc1 = vdupq_n_f32(0.0f);
+                for (int k = 0; k < 32; k += 16) {
+                    int8x16_t q = vld1q_s8(qs + k);
+                    int16x8_t qlo = vmovl_s8(vget_low_s8(q));
+                    int16x8_t qhi = vmovl_s8(vget_high_s8(q));
+                    acc0 = vfmaq_f32(acc0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(qlo))), vld1q_f32(x + base + k + 0));
+                    acc1 = vfmaq_f32(acc1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(qlo))), vld1q_f32(x + base + k + 4));
+                    acc0 = vfmaq_f32(acc0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(qhi))), vld1q_f32(x + base + k + 8));
+                    acc1 = vfmaq_f32(acc1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(qhi))), vld1q_f32(x + base + k + 12));
+                }
+                float32x4_t sum4 = vaddq_f32(acc0, acc1);
+#if defined(__aarch64__)
+                total += d * vaddvq_f32(sum4);
+#else
+                float32x2_t p2 = vadd_f32(vget_low_f32(sum4), vget_high_f32(sum4));
+                total += d * vget_lane_f32(vpadd_f32(p2, p2), 0);
+#endif
                 continue;
             }
 #endif

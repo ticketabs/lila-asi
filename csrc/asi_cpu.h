@@ -14,6 +14,8 @@
 #  elif defined(__GNUC__) || defined(__clang__)
 #    include <cpuid.h>
 #  endif
+#elif defined(__linux__) && (defined(__aarch64__) || defined(__arm__))
+#  include <sys/auxv.h>
 #endif
 
 static inline int asi_cpu_is_compiled_avx2(void)
@@ -22,6 +24,45 @@ static inline int asi_cpu_is_compiled_avx2(void)
     return 1;
 #else
     return 0;
+#endif
+}
+
+static inline int asi_cpu_is_compiled_neon(void)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(_M_ARM64)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+static inline int asi_cpu_is_compiled_dotprod(void)
+{
+#if defined(__ARM_FEATURE_DOTPROD)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+static inline int asi_cpu_is_compiled_fp16(void)
+{
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) || defined(__F16C__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+static inline int asi_cpu_has_arm_dotprod(void)
+{
+#if defined(__linux__) && defined(__aarch64__)
+    unsigned long hwcap = getauxval(AT_HWCAP);
+    return (hwcap & (1UL << 20)) ? 1 : 0; /* HWCAP_ASIMDDP */
+#elif defined(__APPLE__) && (defined(__aarch64__) || defined(_M_ARM64))
+    return 1;
+#else
+    return asi_cpu_is_compiled_dotprod();
 #endif
 }
 
@@ -82,17 +123,25 @@ static inline void asi_cpu_feature_string(char *buf, size_t cap)
     if (!buf || cap == 0) return;
 #if defined(__x86_64__) || defined(_M_X64)
     const char *arch = "x86_64";
-#elif defined(__aarch64__) || defined(_M_ARM64)
-    const char *arch = "arm64";
-#else
-    const char *arch = "generic";
-#endif
     int hw_avx2 = asi_cpu_has_avx2_fma_f16c();
     int compiled_avx2 = asi_cpu_is_compiled_avx2();
     snprintf(buf, cap, "%s compiled=%s host_avx2_fma_f16c=%s",
              arch,
              compiled_avx2 ? "avx2-fma-f16c" : "scalar",
              hw_avx2 ? "yes" : "no");
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    const char *arch = "arm64";
+    const char *cfeat = asi_cpu_is_compiled_dotprod()
+        ? (asi_cpu_is_compiled_fp16() ? "neon+dotprod+fp16" : "neon+dotprod")
+        : (asi_cpu_is_compiled_neon() ? "neon" : "scalar");
+    snprintf(buf, cap, "%s compiled=%s host_dotprod=%s",
+             arch,
+             cfeat,
+             asi_cpu_has_arm_dotprod() ? "yes" : "no");
+#else
+    const char *arch = "generic";
+    snprintf(buf, cap, "%s compiled=scalar", arch);
+#endif
 }
 
 #endif /* LILA_ASI_CPU_H */

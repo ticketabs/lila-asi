@@ -12,6 +12,8 @@
 
 #if defined(__AVX2__)
 #include <immintrin.h>
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
 #endif
 
 int asi_kernel_ctx_init(AsiKernelCtx *ctx,
@@ -246,6 +248,18 @@ static inline __m256 avx2_apply_act_ps(__m256 v, uint32_t act_type)
 #endif
 #endif
 
+#if defined(__ARM_NEON) || defined(__aarch64__)
+static inline float hsum_f32x4(float32x4_t v)
+{
+#if defined(__aarch64__)
+    return vaddvq_f32(v);
+#else
+    float32x2_t s = vadd_f32(vget_low_f32(v), vget_high_f32(v));
+    return vget_lane_f32(vpadd_f32(s, s), 0);
+#endif
+}
+#endif
+
 static inline int asi_fast_q8_enabled(void)
 {
     const char *v = getenv("LILA_ASI_VISION_FAST_Q8");
@@ -271,6 +285,14 @@ typedef struct {
     const int8_t  *xq_qs;
     const float   *xq_d;
 } LinearQuantCtx;
+
+typedef struct {
+    const float *x;
+    uint32_t     K;
+    uint32_t     nb;
+    int8_t      *xq_qs;
+    float       *xq_d;
+} QuantX8Ctx;
 
 #if defined(__AVX2__) && defined(__FMA__)
 /* L2/L1 cache-blocked Q8_0 x FP32 AVX2+FMA GEMM (MB=60, KB=256, NB=64/16/8).
@@ -502,14 +524,6 @@ static void linear_q8_fp32_tile_range(uint32_t t0, uint32_t t1, int tid, void *v
 /* INT8 x INT8 (Q8_0 x Q8_0) AVX2+FMA fast path (LILA_ASI_VISION_FAST_Q8=1).
  * Uses symmetric [-127, 127] activation quantization so vpmaddubsw(|w|, sign(x, w))
  * is exact and never overflows int16 even when w == -128. */
-typedef struct {
-    const float *x;
-    uint32_t     K;
-    uint32_t     nb;
-    int8_t      *xq_qs;
-    float       *xq_d;
-} QuantX8Ctx;
-
 static void quantize_x_q8_range(uint32_t m0, uint32_t m1, int tid, void *vctx)
 {
     (void)tid;
@@ -720,7 +734,144 @@ static void linear_q8_q8_tile_range(uint32_t t0, uint32_t t1, int tid, void *vct
         epilogue_store_tile_avx2(c_tile, m0, m_cnt, n0, n_cnt, N, c->act_type, c->bias, c->residual, c->out);
     }
 }
-#endif /* __AVX2__ && __FMA__ */
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+static void quantize_x_q8_neon_range(uint32_t m0, uint32_t m1, int tid, void *vctx)
+{
+    (void)tid;
+    const QuantX8Ctx *q = (const QuantX8Ctx *)vctx;
+    const uint32_t K = q->K;
+    const uint32_t nb = q->nb;
+    const int8x16_t min_q8 = vdupq_n_s8(-127);
+
+    for (uint32_t m = m0; m < m1; m++) {
+        const float *xm = q->x + (size_t)m * K;
+        int8_t *dst_qs = q->xq_qs + (size_t)m * nb * 32u;
+        float *dst_d = q->xq_d + (size_t)m * nb;
+        for (uint32_t b = 0u; b < nb; b++) {
+            const float *sp = xm + (size_t)b * 32u;
+            float32x4_t mx = vabsq_f32(vld1q_f32(sp + 0u));
+            for (uint32_t k = 4u; k < 32u; k += 4u) {
+                mx = vmaxq_f32(mx, vabsq_f32(vld1q_f32(sp + k)));
+            }
+#if defined(__aarch64__)
+            float amax = vmaxvq_f32(mx);
+#else
+            float32x2_t m2 = vpmax_f32(vget_low_f32(mx), vget_high_f32(mx));
+            m2 = vpmax_f32(m2, m2);
+            float amax = vget_lane_f32(m2, 0);
+#endif
+            float d = amax / 127.0f;
+            float id = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+            dst_d[b] = d;
+            float32x4_t vid = vdupq_n_f32(id);
+            for (uint32_t c = 0u; c < 2u; c++) {
+                const float *cp = sp + c * 16u;
+#if defined(__aarch64__)
+                int32x4_t i0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(cp + 0u), vid));
+                int32x4_t i1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(cp + 4u), vid));
+                int32x4_t i2 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(cp + 8u), vid));
+                int32x4_t i3 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(cp + 12u), vid));
+#else
+                int32x4_t i0 = vcvtq_s32_f32(vmulq_f32(vld1q_f32(cp + 0u), vid));
+                int32x4_t i1 = vcvtq_s32_f32(vmulq_f32(vld1q_f32(cp + 4u), vid));
+                int32x4_t i2 = vcvtq_s32_f32(vmulq_f32(vld1q_f32(cp + 8u), vid));
+                int32x4_t i3 = vcvtq_s32_f32(vmulq_f32(vld1q_f32(cp + 12u), vid));
+#endif
+                int16x8_t p01 = vcombine_s16(vqmovn_s32(i0), vqmovn_s32(i1));
+                int16x8_t p23 = vcombine_s16(vqmovn_s32(i2), vqmovn_s32(i3));
+                int8x16_t q8 = vmaxq_s8(vcombine_s8(vqmovn_s16(p01), vqmovn_s16(p23)), min_q8);
+                vst1q_s8(dst_qs + (size_t)b * 32u + c * 16u, q8);
+            }
+        }
+    }
+}
+
+static inline int32_t neon_dot_s8x32(const int8_t *w, const int8_t *x)
+{
+    int32x4_t acc = vdupq_n_s32(0);
+    int8x16_t w0 = vld1q_s8(w + 0);
+    int8x16_t x0 = vld1q_s8(x + 0);
+    int8x16_t w1 = vld1q_s8(w + 16);
+    int8x16_t x1 = vld1q_s8(x + 16);
+#if defined(__ARM_FEATURE_DOTPROD)
+    acc = vdotq_s32(acc, w0, x0);
+    acc = vdotq_s32(acc, w1, x1);
+#else
+    acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(w0), vget_low_s8(x0)));
+    acc = vpadalq_s16(acc, vmull_s8(vget_high_s8(w0), vget_high_s8(x0)));
+    acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(w1), vget_low_s8(x1)));
+    acc = vpadalq_s16(acc, vmull_s8(vget_high_s8(w1), vget_high_s8(x1)));
+#endif
+#if defined(__aarch64__)
+    return vaddvq_s32(acc);
+#else
+    int32x2_t s = vadd_s32(vget_low_s32(acc), vget_high_s32(acc));
+    return vget_lane_s32(vpadd_s32(s, s), 0);
+#endif
+}
+
+static void linear_q8_q8_neon_range(uint32_t n0, uint32_t n1, int tid, void *vctx)
+{
+    (void)tid;
+    const LinearQuantCtx *c = (const LinearQuantCtx *)vctx;
+    const uint32_t M = c->M;
+    const uint32_t N = c->N;
+    const uint32_t nb = c->K / 32u;
+    const uint32_t act = c->act_type;
+    const float *bias = c->bias;
+    const float *res = c->residual;
+    float *out = c->out;
+
+    for (uint32_t n = n0; n < n1; n++) {
+        const uint8_t *w_row = c->w_data + (size_t)n * c->row_bytes;
+        float b_val = bias ? bias[n] : 0.0f;
+        uint32_t m = 0u;
+        for (; m + 3u < M; m += 4u) {
+            const int8_t *x0 = c->xq_qs + (size_t)(m + 0u) * nb * 32u;
+            const int8_t *x1 = c->xq_qs + (size_t)(m + 1u) * nb * 32u;
+            const int8_t *x2 = c->xq_qs + (size_t)(m + 2u) * nb * 32u;
+            const int8_t *x3 = c->xq_qs + (size_t)(m + 3u) * nb * 32u;
+            const float *dx0 = c->xq_d + (size_t)(m + 0u) * nb;
+            const float *dx1 = c->xq_d + (size_t)(m + 1u) * nb;
+            const float *dx2 = c->xq_d + (size_t)(m + 2u) * nb;
+            const float *dx3 = c->xq_d + (size_t)(m + 3u) * nb;
+            float s0 = b_val, s1 = b_val, s2 = b_val, s3 = b_val;
+            for (uint32_t b = 0u; b < nb; b++) {
+                const uint8_t *blk = w_row + (size_t)b * Q8_0_BLOCK_SIZE;
+                uint16_t dw_raw;
+                memcpy(&dw_raw, blk, sizeof(dw_raw));
+                float dw = fp16_to_fp32(dw_raw);
+                const int8_t *wq = (const int8_t *)(blk + 2u);
+                s0 += (float)neon_dot_s8x32(wq, x0 + b * 32u) * (dw * dx0[b]);
+                s1 += (float)neon_dot_s8x32(wq, x1 + b * 32u) * (dw * dx1[b]);
+                s2 += (float)neon_dot_s8x32(wq, x2 + b * 32u) * (dw * dx2[b]);
+                s3 += (float)neon_dot_s8x32(wq, x3 + b * 32u) * (dw * dx3[b]);
+            }
+            float vals[4] = { s0, s1, s2, s3 };
+            for (uint32_t tm = 0u; tm < 4u; tm++) {
+                float v = (act == ASI_ACT_NONE) ? vals[tm] : apply_act_scalar(vals[tm], act);
+                size_t oi = (size_t)(m + tm) * N + n;
+                out[oi] = res ? (res[oi] + v) : v;
+            }
+        }
+        for (; m < M; m++) {
+            const int8_t *xm = c->xq_qs + (size_t)m * nb * 32u;
+            const float *dxm = c->xq_d + (size_t)m * nb;
+            float s = b_val;
+            for (uint32_t b = 0u; b < nb; b++) {
+                const uint8_t *blk = w_row + (size_t)b * Q8_0_BLOCK_SIZE;
+                uint16_t dw_raw;
+                memcpy(&dw_raw, blk, sizeof(dw_raw));
+                float dw = fp16_to_fp32(dw_raw);
+                s += (float)neon_dot_s8x32((const int8_t *)(blk + 2u), xm + b * 32u) * (dw * dxm[b]);
+            }
+            if (act != ASI_ACT_NONE) s = apply_act_scalar(s, act);
+            size_t oi = (size_t)m * N + n;
+            out[oi] = res ? (res[oi] + s) : s;
+        }
+    }
+}
+#endif /* __AVX2__ && __FMA__ / __ARM_NEON */
 
 static void linear_quant_range(uint32_t n0, uint32_t n1, int tid, void *vctx)
 {
@@ -764,6 +915,49 @@ static void linear_quant_range(uint32_t n0, uint32_t n1, int tid, void *vctx)
                     s1 += wv * x1[k];
                     s2 += wv * x2[k];
                     s3 += wv * x3[k];
+                }
+                float vals[4] = { s0 + b_val, s1 + b_val, s2 + b_val, s3 + b_val };
+                for (uint32_t tm = 0u; tm < 4u; tm++) {
+                    float v = (act == ASI_ACT_NONE) ? vals[tm] : apply_act_scalar(vals[tm], act);
+                    size_t oi = (size_t)(m + tm) * N + n;
+                    out[oi] = res ? (res[oi] + v) : v;
+                }
+            }
+            for (; m < M; m++) {
+                const float *xm = c->x + (size_t)m * K;
+                float v = lila_fp32_dot_slice(w_row, xm, (int)K) + b_val;
+                if (act != ASI_ACT_NONE) v = apply_act_scalar(v, act);
+                size_t oi = (size_t)m * N + n;
+                out[oi] = res ? (res[oi] + v) : v;
+            }
+        }
+        return;
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+        uint32_t k4 = K & ~3u;
+        for (uint32_t n = n0; n < n1; n++) {
+            const float *w_row = (const float *)(c->w_data + (size_t)n * c->row_bytes);
+            float b_val = bias ? bias[n] : 0.0f;
+            uint32_t m = 0u;
+            for (; m + 3u < M; m += 4u) {
+                const float *x0 = c->x + (size_t)(m + 0u) * K;
+                const float *x1 = c->x + (size_t)(m + 1u) * K;
+                const float *x2 = c->x + (size_t)(m + 2u) * K;
+                const float *x3 = c->x + (size_t)(m + 3u) * K;
+                float32x4_t a0 = vdupq_n_f32(0.0f);
+                float32x4_t a1 = vdupq_n_f32(0.0f);
+                float32x4_t a2 = vdupq_n_f32(0.0f);
+                float32x4_t a3 = vdupq_n_f32(0.0f);
+                for (uint32_t k = 0u; k < k4; k += 4u) {
+                    float32x4_t wf = vld1q_f32(w_row + k);
+                    a0 = vfmaq_f32(a0, wf, vld1q_f32(x0 + k));
+                    a1 = vfmaq_f32(a1, wf, vld1q_f32(x1 + k));
+                    a2 = vfmaq_f32(a2, wf, vld1q_f32(x2 + k));
+                    a3 = vfmaq_f32(a3, wf, vld1q_f32(x3 + k));
+                }
+                float s0 = hsum_f32x4(a0), s1 = hsum_f32x4(a1), s2 = hsum_f32x4(a2), s3 = hsum_f32x4(a3);
+                for (uint32_t k = k4; k < K; k++) {
+                    float wv = w_row[k];
+                    s0 += wv * x0[k]; s1 += wv * x1[k]; s2 += wv * x2[k]; s3 += wv * x3[k];
                 }
                 float vals[4] = { s0 + b_val, s1 + b_val, s2 + b_val, s3 + b_val };
                 for (uint32_t tm = 0u; tm < 4u; tm++) {
@@ -850,6 +1044,29 @@ int asi_k_linear_quant_bias(AsiKernelCtx *ctx,
         asi_kernel_parallel_for(ctx, total_tiles, 1u, linear_q8_fp32_tile_range, &lc);
         return (ctx && ctx->cancel_flag && *ctx->cancel_flag) ? -2 : 0;
     }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+    if (quant_type == 8u && (K & 31u) == 0u) {
+        uint32_t nb = K / 32u;
+        int8_t *xq_qs = (int8_t *)asi_aligned_alloc(32u, (size_t)M * nb * 32u);
+        float *xq_d = (float *)malloc((size_t)M * nb * sizeof(float));
+        if (xq_qs && xq_d) {
+            QuantX8Ctx qctx = {x, K, nb, xq_qs, xq_d};
+            asi_kernel_parallel_for(ctx, M, 16u, quantize_x_q8_neon_range, &qctx);
+            if (!(ctx && ctx->cancel_flag && *ctx->cancel_flag)) {
+                LinearQuantCtx lc = {
+                    w_data, row_bytes, quant_type, bias, x, M, N, K, act_type, residual, out,
+                    0u, 0u, 0u, xq_qs, xq_d
+                };
+                uint32_t grain = (N >= 128u) ? 16u : 4u;
+                asi_kernel_parallel_for(ctx, N, grain, linear_q8_q8_neon_range, &lc);
+            }
+            free(xq_d);
+            asi_aligned_free(xq_qs);
+            return (ctx && ctx->cancel_flag && *ctx->cancel_flag) ? -2 : 0;
+        }
+        free(xq_d);
+        asi_aligned_free(xq_qs);
+    }
 #endif
 
     LinearQuantCtx lc = {
@@ -890,6 +1107,15 @@ static void layernorm_range(uint32_t r0, uint32_t r1, int tid, void *vctx)
         __m256d vs = _mm256_add_pd(vsum0, vsum1);
         __m128d vs2 = _mm_add_pd(_mm256_castpd256_pd128(vs), _mm256_extractf128_pd(vs, 1));
         sum = _mm_cvtsd_f64(_mm_add_sd(vs2, _mm_unpackhi_pd(vs2, vs2)));
+#elif defined(__aarch64__)
+        float64x2_t vsum0 = vdupq_n_f64(0.0);
+        float64x2_t vsum1 = vdupq_n_f64(0.0);
+        for (; i + 3u < D; i += 4u) {
+            float32x4_t fv = vld1q_f32(xr + i);
+            vsum0 = vaddq_f64(vsum0, vcvt_f64_f32(vget_low_f32(fv)));
+            vsum1 = vaddq_f64(vsum1, vcvt_high_f64_f32(fv));
+        }
+        sum = vaddvq_f64(vaddq_f64(vsum0, vsum1));
 #endif
         for (; i < D; i++) sum += (double)xr[i];
         double mean = sum / (double)D;
@@ -908,6 +1134,18 @@ static void layernorm_range(uint32_t r0, uint32_t r1, int tid, void *vctx)
         __m256d vv = _mm256_add_pd(vv0, vv1);
         __m128d vv2 = _mm_add_pd(_mm256_castpd256_pd128(vv), _mm256_extractf128_pd(vv, 1));
         var_sum = _mm_cvtsd_f64(_mm_add_sd(vv2, _mm_unpackhi_pd(vv2, vv2)));
+#elif defined(__aarch64__)
+        float64x2_t vmean = vdupq_n_f64(mean);
+        float64x2_t vv0 = vdupq_n_f64(0.0);
+        float64x2_t vv1 = vdupq_n_f64(0.0);
+        for (; i + 3u < D; i += 4u) {
+            float32x4_t fv = vld1q_f32(xr + i);
+            float64x2_t d0 = vsubq_f64(vcvt_f64_f32(vget_low_f32(fv)), vmean);
+            float64x2_t d1 = vsubq_f64(vcvt_high_f64_f32(fv), vmean);
+            vv0 = vfmaq_f64(vv0, d0, d0);
+            vv1 = vfmaq_f64(vv1, d1, d1);
+        }
+        var_sum = vaddvq_f64(vaddq_f64(vv0, vv1));
 #endif
         for (; i < D; i++) {
             double d = (double)xr[i] - mean;
@@ -929,6 +1167,20 @@ static void layernorm_range(uint32_t r0, uint32_t r1, int tid, void *vctx)
             for (; i + 7u < D; i += 8u) {
                 __m256 xv = _mm256_sub_ps(_mm256_loadu_ps(xr + i), vm);
                 _mm256_storeu_ps(orow + i, _mm256_mul_ps(_mm256_mul_ps(xv, vi), _mm256_loadu_ps(c->w + i)));
+            }
+        }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+        float32x4_t vm = vdupq_n_f32(m_f);
+        float32x4_t vi = vdupq_n_f32(inv_std);
+        if (c->b) {
+            for (; i + 3u < D; i += 4u) {
+                float32x4_t xv = vmulq_f32(vsubq_f32(vld1q_f32(xr + i), vm), vi);
+                vst1q_f32(orow + i, vfmaq_f32(vld1q_f32(c->b + i), xv, vld1q_f32(c->w + i)));
+            }
+        } else {
+            for (; i + 3u < D; i += 4u) {
+                float32x4_t xv = vmulq_f32(vsubq_f32(vld1q_f32(xr + i), vm), vi);
+                vst1q_f32(orow + i, vmulq_f32(xv, vld1q_f32(c->w + i)));
             }
         }
 #endif
@@ -967,7 +1219,15 @@ static void rmsnorm_range(uint32_t r0, uint32_t r1, int tid, void *vctx)
             ss += v * v;
         }
         float inv_rms = (float)(1.0 / sqrt(ss / (double)D + (double)c->eps));
-        for (uint32_t i = 0u; i < D; i++) {
+        uint32_t i = 0u;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+        float32x4_t vir = vdupq_n_f32(inv_rms);
+        for (; i + 3u < D; i += 4u) {
+            float32x4_t xw = vmulq_f32(vld1q_f32(xr + i), vld1q_f32(c->w + i));
+            vst1q_f32(orow + i, vmulq_f32(xw, vir));
+        }
+#endif
+        for (; i < D; i++) {
             orow[i] = xr[i] * inv_rms * c->w[i];
         }
     }
@@ -1011,6 +1271,10 @@ void asi_k_add_inplace(AsiKernelCtx *ctx,
         __m256 d = _mm256_loadu_ps(dst + i);
         __m256 s = _mm256_loadu_ps(src + i);
         _mm256_storeu_ps(dst + i, _mm256_add_ps(d, s));
+    }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+    for (; i + 3u < n; i += 4u) {
+        vst1q_f32(dst + i, vaddq_f32(vld1q_f32(dst + i), vld1q_f32(src + i)));
     }
 #endif
     for (; i < n; i++) dst[i] += src[i];
@@ -1150,6 +1414,19 @@ static void conv3d_patch_range(uint32_t d0, uint32_t d1, int tid, void *vctx)
                 }
             }
             acc += hsum_m256(va);
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+            float32x4_t va = vdupq_n_f32(0.0f);
+            if (r1) {
+                for (; k + 3u < pv; k += 4u) {
+                    float32x4_t ws = vaddq_f32(vld1q_f32(r0 + k), vld1q_f32(r1 + k));
+                    va = vfmaq_f32(va, vld1q_f32(pvec + k), ws);
+                }
+            } else {
+                for (; k + 3u < pv; k += 4u) {
+                    va = vfmaq_f32(va, vld1q_f32(pvec + k), vld1q_f32(r0 + k));
+                }
+            }
+            acc += hsum_f32x4(va);
 #endif
             if (r1) {
                 for (; k < pv; k++) acc += pvec[k] * (r0[k] + r1[k]);
@@ -1304,6 +1581,15 @@ static void rope_2d_qkv_range(uint32_t p0, uint32_t p1, int tid, void *vctx)
                     __m256 vs = _mm256_loadu_ps(sn + i);
                     _mm256_storeu_ps(vh + i, _mm256_fmsub_ps(v1, vc, _mm256_mul_ps(v2, vs)));
                     _mm256_storeu_ps(vh + i + half, _mm256_fmadd_ps(v1, vs, _mm256_mul_ps(v2, vc)));
+                }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+                for (; i + 3u < half; i += 4u) {
+                    float32x4_t v1 = vld1q_f32(vh + i);
+                    float32x4_t v2 = vld1q_f32(vh + i + half);
+                    float32x4_t vc = vld1q_f32(cs + i);
+                    float32x4_t vs = vld1q_f32(sn + i);
+                    vst1q_f32(vh + i, vmlsq_f32(vmulq_f32(v1, vc), v2, vs));
+                    vst1q_f32(vh + i + half, vfmaq_f32(vmulq_f32(v2, vc), v1, vs));
                 }
 #endif
                 for (; i < half; i++) {
@@ -1580,6 +1866,13 @@ static void sdpa_bidir_head_range(uint32_t h0, uint32_t h1, int tid, void *vctx)
                     __m256 ov = _mm256_loadu_ps(out_vec + d);
                     __m256 vv = _mm256_loadu_ps(v_vec + d);
                     _mm256_storeu_ps(out_vec + d, _mm256_fmadd_ps(vw, vv, ov));
+                }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+                float32x4_t vw = vdupq_n_f32(w);
+                for (; d + 3u < hd; d += 4u) {
+                    float32x4_t ov = vld1q_f32(out_vec + d);
+                    float32x4_t vv = vld1q_f32(v_vec + d);
+                    vst1q_f32(out_vec + d, vfmaq_f32(ov, vw, vv));
                 }
 #endif
                 for (; d < hd; d++) out_vec[d] += w * v_vec[d];

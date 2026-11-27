@@ -12,10 +12,10 @@ endif
 ifeq ($(UNAME_M),x86_64)
     CFLAGS += -march=native -mavx2 -mfma -mf16c
 else ifneq ($(filter $(UNAME_M),aarch64 arm64),)
-    CFLAGS += -march=native
+    CFLAGS += -march=armv8.2-a+dotprod+fp16
 endif
 
-LIB_SRC := asi_ed25519.c asi_v2.c asi_arch.c asi_dense.c lila_lm_head_candidate.c lila_asi.c asi_grammar_sparse.c e05_bridge.c asi_state_centric.c asi_kernels.c asi_graph.c asi_pairing.c asi_vision.c
+LIB_SRC := asi_ed25519.c asi_v2.c asi_arch.c asi_dense.c lila_lm_head_candidate.c lila_asi.c asi_grammar_sparse.c e05_bridge.c asi_state_centric.c asi_kernels.c asi_graph.c asi_pairing.c asi_vision.c asi_mcu.c
 
 .PHONY: all clean
 
