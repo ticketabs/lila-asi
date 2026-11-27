@@ -251,6 +251,7 @@ static inline AsiThreadPool *asi_pool_create(int n_threads)
     int phys = asi_detect_physical_cores();
     p->spin_limit = (n_threads > phys) ? 64 : 2048;
     p->yield_limit = (n_threads > phys) ? 128 : 4096;
+    /* LILA_ASI_SPIN_LIMIT overrides busy-wait pause count before workers block on condvar. */
     const char *env_spin = getenv("LILA_ASI_SPIN_LIMIT");
     if (env_spin && env_spin[0] != '\0')
     {

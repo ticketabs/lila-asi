@@ -24,6 +24,7 @@
 #else
 #  include <pthread.h>
 #  include <strings.h>
+#  include <sys/mman.h>
 #  include <sys/stat.h>
 #  include <time.h>
 #  include <unistd.h>
@@ -217,5 +218,36 @@ static inline void asi_call_once(AsiOnce *once, void (*fn)(void))
     pthread_once(once, fn);
 }
 #endif
+
+/*
+ * E08-E bounded-RAM streaming helpers (Linux madvise; safe no-ops on other platforms).
+ * Prefetch rounds outward to 4096 B page boundaries; eviction uses strictly interior
+ * pages so neighboring tensors/headers sharing boundary pages are never dropped.
+ */
+static inline void asi_stream_prefetch_pages(const void *ptr, size_t len)
+{
+#if defined(__linux__) && defined(MADV_WILLNEED)
+    if (!ptr || len == 0u) return;
+    uintptr_t p0 = (uintptr_t)ptr & ~(uintptr_t)4095u;
+    uintptr_t p1 = ((uintptr_t)ptr + len + 4095u) & ~(uintptr_t)4095u;
+    if (p1 > p0) madvise((void *)p0, (size_t)(p1 - p0), MADV_WILLNEED);
+#else
+    (void)ptr;
+    (void)len;
+#endif
+}
+
+static inline void asi_stream_evict_pages(const void *ptr, size_t len)
+{
+#if defined(__linux__) && defined(MADV_DONTNEED)
+    if (!ptr || len <= 4096u) return;
+    uintptr_t p0 = ((uintptr_t)ptr + 4095u) & ~(uintptr_t)4095u;
+    uintptr_t p1 = ((uintptr_t)ptr + len) & ~(uintptr_t)4095u;
+    if (p1 > p0) madvise((void *)p0, (size_t)(p1 - p0), MADV_DONTNEED);
+#else
+    (void)ptr;
+    (void)len;
+#endif
+}
 
 #endif /* LILA_ASI_PLATFORM_H */

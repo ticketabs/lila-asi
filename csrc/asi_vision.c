@@ -738,6 +738,7 @@ LilaAsiVisionModel *lila_asi_vision_open(const char *asiv_path, char *err_buf, s
     const AsiV2SectionEntry *vsec = NULL;
     const AsiV2SectionEntry *gsec = NULL;
     const AsiV2SectionEntry *psec = NULL;
+    /* LILA_ASI_VERIFY_CRC=1 forces eager CRC-64 checks over bulk .asiv vision weight sections. */
     const char *verify_env = getenv("LILA_ASI_VERIFY_CRC");
     int verify_bulk = (verify_env && verify_env[0] == '1');
 
@@ -833,6 +834,7 @@ LilaAsiVisionModel *lila_asi_vision_open(const char *asiv_path, char *err_buf, s
         vm->has_pairing = 1;
     }
 
+    /* LILA_ASI_VISION_EXEC=graph|fast overrides automatic fast-path vs ASIG0001 DAG selection. */
     const char *exec_env = getenv("LILA_ASI_VISION_EXEC");
     vm->exec_mode = ASI_VISION_EXEC_AUTO;
     if (exec_env && exec_env[0] != '\0') {

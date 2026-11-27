@@ -177,6 +177,8 @@ int asi_v2_validate_memory(const uint8_t *data, size_t size, AsiV2Cartridge *out
         }
         int is_bulk_blob = (s->type == ASI_SEC_WEIGHTS || s->type == ASI_SEC_VISION ||
                             s->type == ASI_SEC_AUDIO || s->type == ASI_SEC_SIEVE_SKETCH);
+        /* Bulk sections rely on lazy mmap demand paging by default; LILA_ASI_VERIFY_CRC=1
+         * forces eager full-file CRC-64 checks at open() for cold integrity audits. */
         const char *verify_env = getenv("LILA_ASI_VERIFY_CRC");
         if (!is_bulk_blob || (verify_env && verify_env[0] == '1'))
         {
@@ -239,6 +241,8 @@ int asi_v2_validate_memory(const uint8_t *data, size_t size, AsiV2Cartridge *out
         return -1;
     }
 
+    /* LILA_ASI_REQUIRE_SIGNATURE=1 fails closed on unsigned or tampered cartridges;
+     * LILA_ASI_TRUSTED_PUBKEY=<64hex> pins the expected publisher Ed25519 key. */
     const char *req_sig = getenv("LILA_ASI_REQUIRE_SIGNATURE");
     if (req_sig && req_sig[0] == '1')
     {
@@ -326,6 +330,8 @@ int asi_v2_open(const char *path, AsiV2Cartridge *out, char *err_buf, size_t err
     }
 #ifdef MADV_HUGEPAGE
     {
+        /* Enable Transparent Huge Pages (+45.8% DDR3L bandwidth on Broadwell) unless
+         * LILA_ASI_NO_HUGEPAGE=1 opts out (e.g., to test 4 KiB page baseline behavior). */
         const char *no_thp = getenv("LILA_ASI_NO_HUGEPAGE");
         if (!no_thp || no_thp[0] != '1')
             madvise(m, file_size, MADV_HUGEPAGE);

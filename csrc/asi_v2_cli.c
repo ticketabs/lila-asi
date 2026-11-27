@@ -68,30 +68,31 @@ static const char *section_type_name(uint32_t stype)
     }
 }
 
+/* Translate CLI --mode preset into coordinated LILA_ASI_* switches consumed by session_create. */
 static void apply_mode_env(const char *mode)
 {
     if (!mode || !mode[0]) return;
     if (strcmp(mode, "fast") == 0)
     {
-        asi_setenv("LILA_ASI_MODE", "fast");
-        asi_setenv("LILA_ASI_LMHEAD_MODE", "1bit1024");
-        asi_setenv("LILA_ASI_LMHEAD_K", "2048");
-        asi_setenv("LILA_ASI_SPECULATIVE", "1");
-        asi_setenv("LILA_ASI_SPEC_GATE", "1");
+        asi_setenv("LILA_ASI_MODE", "fast");             /* Default high-speed preset (+sparse ffn_down) */
+        asi_setenv("LILA_ASI_LMHEAD_MODE", "1bit1024");  /* 1-bit Hadamard Sieve over 248K vocab */
+        asi_setenv("LILA_ASI_LMHEAD_K", "2048");         /* Top-K exact Stage-2 candidates */
+        asi_setenv("LILA_ASI_SPECULATIVE", "1");         /* Self-speculative multi-token draft verify */
+        asi_setenv("LILA_ASI_SPEC_GATE", "1");           /* Share Sieve screening across draft lanes */
     }
     else if (strcmp(mode, "balanced") == 0)
     {
-        asi_setenv("LILA_ASI_MODE", "balanced");
-        asi_setenv("LILA_ASI_LMHEAD_MODE", "2bit1024");
-        asi_setenv("LILA_ASI_LMHEAD_K", "1024");
+        asi_setenv("LILA_ASI_MODE", "balanced");         /* Tighter quality preset (dense ffn_down) */
+        asi_setenv("LILA_ASI_LMHEAD_MODE", "2bit1024");  /* 2-bit sign+magnitude Sieve sketch */
+        asi_setenv("LILA_ASI_LMHEAD_K", "1024");         /* Narrower K=1024 Stage-2 refinement */
         asi_setenv("LILA_ASI_SPECULATIVE", "1");
         asi_setenv("LILA_ASI_SPEC_GATE", "1");
     }
     else if (strcmp(mode, "exact") == 0)
     {
-        asi_setenv("LILA_ASI_MODE", "exact");
-        asi_setenv("LILA_ASI_LMHEAD_MODE", "off");
-        asi_setenv("LILA_ASI_SPECULATIVE", "0");
+        asi_setenv("LILA_ASI_MODE", "exact");            /* Zero-approximation parity preset */
+        asi_setenv("LILA_ASI_LMHEAD_MODE", "off");       /* Full exhaustive lm_head evaluation */
+        asi_setenv("LILA_ASI_SPECULATIVE", "0");         /* Disable draft speculation */
         asi_setenv("LILA_ASI_SPEC_GATE", "0");
     }
 }
@@ -276,6 +277,7 @@ static int load_simple_tokenizer(const LilaAsiModel *model, uint32_t vocab_size,
         else if (strcmp(buf, "<|im_end|>") == 0) out_tok->im_end_id = (int32_t)idx;
         idx++;
     }
+    /* LILA_ASI_DEBUG_TOKENS=1 logs parsed vocabulary size from ASI_SEC_TOKENIZER. */
     if (getenv("LILA_ASI_DEBUG_TOKENS"))
     {
         fprintf(stderr, "loaded %u / %u vocab tokens\n", idx, vocab_size);
@@ -702,7 +704,8 @@ int main(int argc, char **argv)
             n_prompt += simple_encode(&tok, "\n", prompt_ids + n_prompt, 8);
             prompt_ids[n_prompt++] = tok.im_start_id;
             n_prompt += simple_encode(&tok, "assistant\n", prompt_ids + n_prompt, 16);
-            if (getenv("LILA_ASI_DEBUG_TOKENS"))
+            /* LILA_ASI_DEBUG_TOKENS=1 logs parsed vocabulary size from ASI_SEC_TOKENIZER. */
+    if (getenv("LILA_ASI_DEBUG_TOKENS"))
             {
                 fprintf(stderr, "prompt_text='%s'\n", prompt_text);
                 for (uint32_t ti = 0; ti < n_prompt; ++ti)

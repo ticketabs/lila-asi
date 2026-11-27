@@ -188,8 +188,10 @@ LilaAsiSession *lila_asi_session_create(LilaAsiModel *model,
     if (model->handler == &g_asi_arch_dense_transformer)
     {
         const AsiV2ModelConfig *cfg = &model->cart.config;
+        /* LILA_ASI_FP32_REF=1 bypasses quantized SIMD paths for unquantized FP32 parity checks. */
         const char *fp32_env = getenv("LILA_ASI_FP32_REF");
         int fp32_ref = (fp32_env && fp32_env[0] != '\0' && strcmp(fp32_env, "0") != 0) ? 1 : 0;
+        /* LILA_ASI_MODE=fast|balanced|exact sets dense-transformer Sieve sketch & K preset. */
         const char *preset_env = getenv("LILA_ASI_MODE");
         LilaLhcMode preset_mode = (!fp32_ref && cfg->vocab_size > 4096u && cfg->hidden_size == 1024u)
                                       ? LILA_LHC_MODE_1BIT_1024
@@ -209,6 +211,7 @@ LilaAsiSession *lila_asi_session_create(LilaAsiModel *model,
                 preset_mode = LILA_LHC_MODE_OFF;
             }
         }
+        /* LILA_ASI_LMHEAD_MODE / LILA_ASI_LMHEAD_K explicitly override dense-model Sieve settings. */
         const char *lhm_env = getenv("LILA_ASI_LMHEAD_MODE");
         LilaLhcMode mode = fp32_ref
                                ? LILA_LHC_MODE_OFF

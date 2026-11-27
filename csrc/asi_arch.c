@@ -56,19 +56,30 @@ static int asi_env_int(const char *name, int def_val, int min_val, int *overridd
 
 static void asi_init_runtime_config(void)
 {
+    /* LILA_ASI_Q6K_DOT2: Enable AVX2/dot2 Q6_K x Q8_K matvec kernel (1=on [default], 0=scalar/legacy fallback). */
     g_asi_rt_cfg.q6k_dot2 = asi_env_int("LILA_ASI_Q6K_DOT2", 1, 0, NULL) ? 1 : 0;
+    /* LILA_ASI_Q4K_DOT2: Enable AVX2/dot2 Q4_K x Q8_K matvec kernel (1=on [default], 0=scalar/legacy fallback). */
     g_asi_rt_cfg.q4k_dot2 = asi_env_int("LILA_ASI_Q4K_DOT2", 1, 0, NULL) ? 1 : 0;
+    /* LILA_ASI_MATVEC_CHUNK: Output rows per worker-pool task for general 2D matvecs (default: 64). */
     g_asi_rt_cfg.matvec_chunk = asi_env_int("LILA_ASI_MATVEC_CHUNK", 64, 1, NULL);
+    /* LILA_ASI_LMHEAD_CHUNK: Output vocab rows per worker-pool task for LM head projection (default: 512). */
     g_asi_rt_cfg.lmhead_chunk = asi_env_int("LILA_ASI_LMHEAD_CHUNK", 512, 1, NULL);
+    /* LILA_ASI_FUSED_CHUNK: Output rows per worker task in fused dual-matvec ops e.g. gate+up (default: 32). */
     g_asi_rt_cfg.fused_chunk = asi_env_int("LILA_ASI_FUSED_CHUNK", 32, 1, &g_asi_rt_cfg.fused_chunk_overridden);
+    /* LILA_ASI_BATCH_CHUNK_MAX: Maximum prompt tokens processed per prefill chunk batch (default: 512). */
     g_asi_rt_cfg.batch_chunk_max = asi_env_int("LILA_ASI_BATCH_CHUNK_MAX", 512, 1, NULL);
+    /* LILA_ASI_BLIS_MIN_TOKENS: Minimum prompt length n_tokens to switch prefill GEMM to BLIS 6x16 packing (default: 96; E07 Exp 2B keeps short <=64 prompts on faster Q6_K x Q8_K). */
     g_asi_rt_cfg.blis_min_tokens = asi_env_int("LILA_ASI_BLIS_MIN_TOKENS", 96, 1, NULL);
+    /* LILA_ASI_PROFILE: Print per-stage timing breakdown (norm/attn/ffn/lmhead) to stderr when non-zero (default: 0). */
     const char *prof = getenv("LILA_ASI_PROFILE");
     g_asi_rt_cfg.profile = (prof && prof[0] != '\0' && strcmp(prof, "0") != 0) ? 1 : 0;
+    /* LILA_ASI_SPECULATIVE: Enable E06/E07 self-speculative multi-word decode using partial/sparse draft (1=on [default], 0=off). */
     g_asi_rt_cfg.speculative = asi_env_int("LILA_ASI_SPECULATIVE", 1, 0, NULL) ? 1 : 0;
+    /* LILA_ASI_SPEC_DRAFT_LEN: Maximum draft tokens per speculative verify step, clamped to ASI_SPEC_MAX_K (default: 3; use 2 for register-safe B=2 on Q4_REPACK). */
     int sdl = asi_env_int("LILA_ASI_SPEC_DRAFT_LEN", 3, 1, NULL);
     if (sdl > (int)ASI_SPEC_MAX_K) sdl = (int)ASI_SPEC_MAX_K;
     g_asi_rt_cfg.spec_draft_len = sdl;
+    /* LILA_ASI_SPEC_STATS: Print speculative draft acceptance rate and verify counts on session close when non-zero (default: 0). */
     const char *ss = getenv("LILA_ASI_SPEC_STATS");
     g_asi_rt_cfg.spec_stats = (ss && ss[0] != '\0' && strcmp(ss, "0") != 0) ? 1 : 0;
 }
@@ -236,6 +247,8 @@ struct AsiArchSession {
     /* ASI v2.6 (Torrent): post-activation sparse ffn_down keep fraction + Q4_REPACK flag */
     float ffn_sparse_keep;
     int has_q4_repack;
+    /* E08-E: opt-in per-layer streaming prefetch + interior-page MADV_DONTNEED eviction */
+    int stream_evict;
     /* Optional activation calibration hook (NULL unless explicitly attached) */
     void (*calib_hook)(void *, uint32_t, int, const float *, uint32_t, uint32_t);
     void *calib_ctx;
@@ -1317,6 +1330,7 @@ static inline int asi_tensor_blis_supported(const AsiV2TensorEntry *t)
     return 0;
 }
 
+/* LILA_ASI_BLIS_PREFILL: Enable BLIS 6x16 cache-blocked prefill GEMM when n_tokens >= LILA_ASI_BLIS_MIN_TOKENS (1=on [default], 0=off). */
 static inline int asi_blis_prefill_enabled(void)
 {
     const char *e = getenv("LILA_ASI_BLIS_PREFILL");
@@ -2580,6 +2594,28 @@ static void qwen35_reset_state(AsiArchSession *s)
     }
 }
 
+/* E08-E: Prefetch (is_evict=0) or interior-page MADV_DONTNEED evict (is_evict=1) layer weight slabs. */
+static void qwen35_stream_advise_layer(const AsiV2Cartridge *cart, const Qwen35LayerWeights *lw, int is_evict)
+{
+    if (!cart || !cart->owns_mmap || !lw) return;
+    const AsiV2TensorEntry *ts[20] = {
+        lw->attn_norm, lw->post_attn_norm, lw->ffn_gate, lw->ffn_up, lw->ffn_down,
+        lw->attn_qkv, lw->attn_gate, lw->ssm_a, lw->ssm_alpha, lw->ssm_beta,
+        lw->ssm_conv1d, lw->ssm_dt_bias, lw->ssm_norm, lw->ssm_out,
+        lw->attn_q, lw->attn_k, lw->attn_v, lw->attn_q_norm, lw->attn_k_norm, lw->attn_output
+    };
+    for (size_t i = 0; i < sizeof(ts) / sizeof(ts[0]); ++i)
+    {
+        const AsiV2TensorEntry *t = ts[i];
+        if (!t || t->data_size == 0u) continue;
+        const void *ptr = tensor_data(cart, t);
+        if (is_evict)
+            asi_stream_evict_pages(ptr, (size_t)t->data_size);
+        else
+            asi_stream_prefetch_pages(ptr, (size_t)t->data_size);
+    }
+}
+
 static int qwen35_init_session(const AsiV2Cartridge *cart,
                                uint32_t max_ctx,
                                uint32_t n_threads,
@@ -2600,6 +2636,7 @@ static int qwen35_init_session(const AsiV2Cartridge *cart,
     s->cart = cart;
     s->max_ctx = max_ctx > 0 ? max_ctx : 2048;
     s->n_threads = n_threads > 0 ? n_threads : 1;
+    /* LILA_ASI_FP32_REF: Dequantize weights to FP32 before matvec for golden reference parity (1=on, 0=off [default]). */
     const char *fp32_env = getenv("LILA_ASI_FP32_REF");
     s->fp32_ref = (fp32_env && atoi(fp32_env) != 0);
     const AsiRuntimeConfig *cfg = asi_runtime_config();
@@ -2637,16 +2674,21 @@ static int qwen35_init_session(const AsiV2Cartridge *cart,
             preset_sparse_keep = 1.0f;
         }
     }
+    /* LILA_ASI_FFN_SPARSE_KEEP: Fraction of largest post-SiLU FFN activations kept for sparse Q4_REPACK ffn_down in (0, 1] (default: 0.5 in fast, 1.0 in balanced/exact). */
     const char *sk_env = getenv("LILA_ASI_FFN_SPARSE_KEEP");
     s->ffn_sparse_keep = (sk_env && sk_env[0] != '\0') ? (float)atof(sk_env) : preset_sparse_keep;
     if (s->ffn_sparse_keep <= 0.0f) s->ffn_sparse_keep = preset_sparse_keep;
     if (s->ffn_sparse_keep > 1.0f) s->ffn_sparse_keep = 1.0f;
+    /* LILA_ASI_SPECULATIVE: Override preset self-speculative decode toggle (1=on, 0=off). */
     s->speculative = asi_env_int("LILA_ASI_SPECULATIVE", preset_spec, 0, NULL) ? 1 : 0;
+    /* LILA_ASI_SPEC_DRAFT_LEN: Override draft length per verify step (1..ASI_SPEC_MAX_K, default from runtime config). */
     int sdl = asi_env_int("LILA_ASI_SPEC_DRAFT_LEN", cfg->spec_draft_len, 1, NULL);
     if (sdl > (int)ASI_SPEC_MAX_K) sdl = (int)ASI_SPEC_MAX_K;
     s->spec_draft_len = sdl;
+    /* LILA_ASI_SPEC_STATS: Print self-speculative acceptance telemetry at session close (1=on, 0=off). */
     const char *ss = getenv("LILA_ASI_SPEC_STATS");
     s->spec_stats = (ss && ss[0] != '\0') ? (strcmp(ss, "0") != 0) : cfg->spec_stats;
+    /* LILA_ASI_LMHEAD_MODE: Override LHC Sieve shortlist mode for LM head ("off"|"1bit512"|"1bit1024"|"2bit1024"). */
     const char *lhm_env = getenv("LILA_ASI_LMHEAD_MODE");
     if (s->fp32_ref)
         s->lmhead_mode = LILA_LHC_MODE_OFF;
@@ -2654,12 +2696,18 @@ static int qwen35_init_session(const AsiV2Cartridge *cart,
         s->lmhead_mode = lila_lhc_parse_mode(lhm_env);
     else
         s->lmhead_mode = preset_lhm;
+    /* LILA_ASI_LMHEAD_K: Number of top candidate rows evaluated exactly after Sieve hashing (default: 2048 fast, 1024 balanced). */
     s->lmhead_k = (uint32_t)asi_env_int("LILA_ASI_LMHEAD_K", preset_k, 1, NULL);
+    /* LILA_ASI_LMHEAD_PREFILL: Apply Sieve LM-head approximation on last prefill token too when non-zero (default: 0=exact prefill logits). */
     s->lmhead_prefill = asi_env_int("LILA_ASI_LMHEAD_PREFILL", 0, 0, NULL) ? 1 : 0;
+    /* LILA_ASI_LMHEAD_STATS: Print Sieve recall/shortlist stats on session close when non-zero (default: 0). */
     const char *lhs = getenv("LILA_ASI_LMHEAD_STATS");
     s->lmhead_stats = (lhs && lhs[0] != '\0' && strcmp(lhs, "0") != 0) ? 1 : 0;
     s->kv_dirty_from = 0;
+    /* LILA_ASI_SPEC_GATE: Enable adaptive failure-hash & cooldown gating for speculative drafting (1=on [fast/balanced], 0=off [exact]). */
     s->spec_gate = asi_env_int("LILA_ASI_SPEC_GATE", preset_spec_gate, 0, NULL) ? 1 : 0;
+    /* LILA_ASI_STREAM_EVICT: E08-E per-layer MADV_WILLNEED prefetch + strict interior-page MADV_DONTNEED eviction for mmap weights (1=on, 0=off [default]). */
+    s->stream_evict = (cart->owns_mmap && asi_env_int("LILA_ASI_STREAM_EVICT", 0, 0, NULL) != 0) ? 1 : 0;
     s->fail_gen = 1;
     s->pool = asi_pool_create((int)s->n_threads);
 
@@ -3355,6 +3403,8 @@ typedef struct {
     _Alignas(64) atomic_int next_h;
 } AsiDeltaNetCtx;
 
+/* LILA_ASI_CHUNKWY: Opt-in E07 Exp 2B ChunkWY-32 parallel DeltaNet prefill scan (default: 0=off).
+ * Kept opt-in because live Broadwell profiling showed sequential CHUNKWY=0 beats ChunkWY-32 by 23-55% due to WY overhead, even though ChunkWY-32 matches exact outputs cleanly. */
 static inline int asi_chunkwy_enabled(void)
 {
     const char *e = getenv("LILA_ASI_CHUNKWY");
@@ -4499,8 +4549,13 @@ static int qwen35_forward_token(AsiArchSession *s, int32_t token_id, uint32_t po
     lila_dequant_row(sc->x, embd_base + (size_t)token_id * embd_rb, (int)c->hidden_size,
                      s->token_embd->quant_type, is_embd_repacked);
 
+    if (s->stream_evict && c->n_layers > 0u)
+        qwen35_stream_advise_layer(cart, &s->layers[0], 0);
+
     for (uint32_t l = 0; l < c->n_layers; ++l)
     {
+        if (s->stream_evict && l + 1u < c->n_layers)
+            qwen35_stream_advise_layer(cart, &s->layers[l + 1u], 0);
         const Qwen35LayerWeights *lw = &s->layers[l];
         const float *an_w = (const float *)tensor_data(cart, lw->attn_norm);
         double tp = do_prof ? asi_now_ms() : 0.0;
@@ -4567,6 +4622,8 @@ static int qwen35_forward_token(AsiArchSession *s, int32_t token_id, uint32_t po
         {
             sc->x[i] += sc->proj_out[i];
         }
+        if (s->stream_evict)
+            qwen35_stream_advise_layer(cart, lw, 1);
         if (do_prof) prof.ffn += asi_now_ms() - tp;
     }
 
@@ -4886,9 +4943,13 @@ static int qwen35_forward_chunk_ex(AsiArchSession *s,
     }
 
     uint32_t i_dn = 0;
+    if (s->stream_evict && c->n_layers > 0u)
+        qwen35_stream_advise_layer(cart, &s->layers[0], 0);
     for (uint32_t l = 0; l < c->n_layers; ++l)
     {
         if (cancel_flag && *cancel_flag) return -2;
+        if (s->stream_evict && l + 1u < c->n_layers)
+            qwen35_stream_advise_layer(cart, &s->layers[l + 1u], 0);
         const Qwen35LayerWeights *lw = &s->layers[l];
         double tp = 0.0;
 
@@ -5091,6 +5152,8 @@ static int qwen35_forward_chunk_ex(AsiArchSession *s,
         }
         asi_norm_quant_pool(s->pool, xb, projb, xnb, qx_h, next_an, B, H, c->rms_norm_eps,
                             1, (next_an != NULL), need_q8_next);
+        if (s->stream_evict)
+            qwen35_stream_advise_layer(cart, lw, 1);
         if (do_prof) t_norm += asi_now_ms() - tp;
     }
 

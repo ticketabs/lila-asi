@@ -1,8 +1,10 @@
 #include "asi_dense.h"
+#include "asi_platform.h"
 #include "asi_pool.h"
 #include "lila_asi.h"
 #include "q4k.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <math.h>
 #include <stddef.h>
@@ -109,6 +111,10 @@ typedef struct {
     DenseRopeMode rope_mode;
     DenseFfnAct ffn_act;
     int fp32_ref;
+    /* E08-E: opt-in per-layer streaming prefetch + interior-page MADV_DONTNEED eviction */
+    int stream_evict;
+    /* E08-D: YaRN attention temperature scale (1.0f for standard/linear/ntk/llama3) */
+    float rope_attn_mscale;
 
     const AsiV2TensorEntry *token_embd;
     const AsiV2TensorEntry *output_norm;
@@ -179,6 +185,151 @@ static int dense_track_alloc(DenseSession *s, void *ptr)
 static inline const uint8_t *dense_tensor_data(const AsiV2Cartridge *cart, const AsiV2TensorEntry *t)
 {
     return cart->weights_data + t->data_offset;
+}
+
+static int dense_ascii_ieq(const char *a, const char *b)
+{
+    if (!a || !b) return 0;
+    while (*a && *b)
+    {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+        ++a;
+        ++b;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+/* E08-E: Prefetch (is_evict=0) or interior-page MADV_DONTNEED evict (is_evict=1) dense layer tensors. */
+static void dense_stream_advise_layer(const AsiV2Cartridge *cart, const DenseLayerWeights *lw, int is_evict)
+{
+    if (!cart || !cart->owns_mmap || !lw) return;
+    const AsiV2TensorEntry *ts[12] = {
+        lw->attn_norm, lw->ffn_norm, lw->attn_post_norm, lw->ffn_post_norm,
+        lw->attn_qkv, lw->attn_q, lw->attn_k, lw->attn_v, lw->attn_output,
+        lw->ffn_gate, lw->ffn_up, lw->ffn_down
+    };
+    for (size_t i = 0; i < sizeof(ts) / sizeof(ts[0]); ++i)
+    {
+        const AsiV2TensorEntry *t = ts[i];
+        if (!t || t->data_size == 0u) continue;
+        const void *ptr = dense_tensor_data(cart, t);
+        if (is_evict)
+            asi_stream_evict_pages(ptr, (size_t)t->data_size);
+        else
+            asi_stream_prefetch_pages(ptr, (size_t)t->data_size);
+    }
+}
+
+/* E08-D: Unified RoPE frequency scaling (Standard / Linear / NTK / YaRN / Llama-3.1). */
+static void dense_init_rope_inv_freq(DenseSession *s)
+{
+    s->rope_attn_mscale = 1.0f;
+    if (s->rope_dim < 2u || !s->rope_inv_freq) return;
+
+    /* LILA_ASI_ROPE_SCALE_MODE: Select long-context RoPE frequency scaling in dense models ("standard" [default]|"linear"|"ntk"|"yarn"|"llama3"). */
+    const char *mode_env = getenv("LILA_ASI_ROPE_SCALE_MODE");
+    /* LILA_ASI_ROPE_SCALE_FACTOR: Context extension multiplier applied by LILA_ASI_ROPE_SCALE_MODE (default: 1.0). */
+    const char *fac_env = getenv("LILA_ASI_ROPE_SCALE_FACTOR");
+    /* LILA_ASI_ROPE_ORIG_CTX: Original training context length for YaRN / Llama-3.1 frequency bands (default: model max_seq_len or 4096). */
+    const char *orig_env = getenv("LILA_ASI_ROPE_ORIG_CTX");
+
+    int mode = 0; /* 0=standard, 1=linear, 2=ntk, 3=yarn, 4=llama31 */
+    if (mode_env && mode_env[0] != '\0')
+    {
+        if (dense_ascii_ieq(mode_env, "linear"))
+            mode = 1;
+        else if (dense_ascii_ieq(mode_env, "ntk"))
+            mode = 2;
+        else if (dense_ascii_ieq(mode_env, "yarn"))
+            mode = 3;
+        else if (dense_ascii_ieq(mode_env, "llama3") ||
+                 dense_ascii_ieq(mode_env, "llama31") ||
+                 dense_ascii_ieq(mode_env, "llama3.1"))
+            mode = 4;
+    }
+
+    double factor = 1.0;
+    if (fac_env && fac_env[0] != '\0')
+    {
+        double parsed = strtod(fac_env, NULL);
+        if (isfinite(parsed) && parsed > 0.0) factor = parsed;
+    }
+
+    uint32_t orig_ctx = (s->cart->config.max_seq_len > 0u) ? s->cart->config.max_seq_len : 4096u;
+    if (orig_env && orig_env[0] != '\0')
+    {
+        long parsed_ctx = strtol(orig_env, NULL, 10);
+        if (parsed_ctx >= 1 && parsed_ctx <= 10485760L) orig_ctx = (uint32_t)parsed_ctx;
+    }
+
+    uint32_t half = s->rope_dim / 2u;
+    if (mode == 0)
+    {
+        for (uint32_t i = 0; i < half; ++i)
+            s->rope_inv_freq[i] = 1.0f / powf(s->rope_theta, (float)(2u * i) / (float)s->rope_dim);
+        return;
+    }
+
+    double d_rope = (double)s->rope_dim;
+    double theta = (double)s->rope_theta;
+    const double pi = 3.14159265358979323846;
+    const double beta_fast = 32.0;
+    const double beta_slow = 1.0;
+    const double low_freq_factor = 1.0;
+    const double high_freq_factor = 4.0;
+
+    if (mode == 3 && factor > 1.0)
+        s->rope_attn_mscale = 0.1f * logf((float)factor) + 1.0f;
+
+    for (uint32_t i = 0; i < half; ++i)
+    {
+        double exp_arg = (2.0 * (double)i) / d_rope;
+        double base_inv = 1.0 / pow(theta, exp_arg);
+        double scaled_inv = base_inv;
+
+        if (mode == 1)
+        {
+            scaled_inv = base_inv / factor;
+        }
+        else if (mode == 2)
+        {
+            if (d_rope > 2.0)
+            {
+                double adj_theta = theta * pow(factor, d_rope / (d_rope - 2.0));
+                scaled_inv = 1.0 / pow(adj_theta, exp_arg);
+            }
+            else
+            {
+                scaled_inv = base_inv / factor;
+            }
+        }
+        else if (mode == 3)
+        {
+            double wavelen = (2.0 * pi) / base_inv;
+            double ratio = (double)orig_ctx / wavelen;
+            double gamma = (ratio - beta_slow) / (beta_fast - beta_slow);
+            if (gamma < 0.0) gamma = 0.0;
+            if (gamma > 1.0) gamma = 1.0;
+            scaled_inv = (1.0 - gamma) * (base_inv / factor) + gamma * base_inv;
+        }
+        else if (mode == 4)
+        {
+            double wavelen = (2.0 * pi) / base_inv;
+            double lo_wl = (double)orig_ctx / low_freq_factor;
+            double hi_wl = (double)orig_ctx / high_freq_factor;
+            if (wavelen < hi_wl)
+                scaled_inv = base_inv;
+            else if (wavelen > lo_wl)
+                scaled_inv = base_inv / factor;
+            else
+            {
+                double smooth = ((double)orig_ctx / wavelen - low_freq_factor) /
+                                (high_freq_factor - low_freq_factor);
+                scaled_inv = (1.0 - smooth) * (base_inv / factor) + smooth * base_inv;
+            }
+        }
+        s->rope_inv_freq[i] = (float)scaled_inv;
+    }
 }
 
 static size_t dense_expected_bytes(uint32_t quant_type, uint32_t layout_flags, uint64_t cols, uint64_t rows)
@@ -1373,8 +1524,13 @@ static int dense_init_session(const AsiV2Cartridge *cart,
     s->rope_mode = (c->arch_id == ASI_ARCH_DENSE_LLAMA) ? DENSE_ROPE_NORM : DENSE_ROPE_NEOX;
     s->ffn_act   = (c->arch_id == ASI_ARCH_DENSE_GEMMA) ? DENSE_ACT_GEGLU : DENSE_ACT_SWIGLU;
 
+    /* LILA_ASI_FP32_REF: Dequantize dense weights to FP32 before matvec for golden parity (1=on, 0=off [default]). */
     const char *fp32_env = getenv("LILA_ASI_FP32_REF");
     s->fp32_ref = (fp32_env && atoi(fp32_env) != 0) ? 1 : 0;
+    /* LILA_ASI_STREAM_EVICT: E08-E per-layer MADV_WILLNEED prefetch + strict interior-page MADV_DONTNEED eviction for mmap weights (1=on, 0=off [default]). */
+    const char *ev_env = getenv("LILA_ASI_STREAM_EVICT");
+    s->stream_evict = (cart->owns_mmap && ev_env && atoi(ev_env) != 0) ? 1 : 0;
+    s->rope_attn_mscale = 1.0f;
 
     s->pool = asi_pool_create((int)s->n_threads);
     if (!s->pool)
@@ -1450,8 +1606,7 @@ static int dense_init_session(const AsiV2Cartridge *cart,
             dense_free_session((AsiArchSession *)s);
             return -1;
         }
-        for (uint32_t i = 0; i < half; ++i)
-            s->rope_inv_freq[i] = 1.0f / powf(s->rope_theta, (float)(2u * i) / (float)s->rope_dim);
+        dense_init_rope_inv_freq(s);
     }
 
     int any_fused_qkv = 0;
@@ -1653,7 +1808,7 @@ static int dense_forward_token(AsiArchSession *session, int32_t token_id, uint32
 
     uint32_t H = c->hidden_size;
     uint32_t I = c->intermediate_size;
-    float attn_scale = 1.0f / sqrtf((float)s->head_dim);
+    float attn_scale = (s->rope_attn_mscale * s->rope_attn_mscale) / sqrtf((float)s->head_dim);
     DenseScratch *sc = &s->scratch;
 
     asi_pool_begin(s->pool);
@@ -1663,8 +1818,13 @@ static int dense_forward_token(AsiArchSession *session, int32_t token_id, uint32
         return -1;
     }
 
+    if (s->stream_evict && c->n_layers > 0u)
+        dense_stream_advise_layer(s->cart, &s->layers[0], 0);
+
     for (uint32_t l = 0; l < c->n_layers; ++l)
     {
+        if (s->stream_evict && l + 1u < c->n_layers)
+            dense_stream_advise_layer(s->cart, &s->layers[l + 1u], 0);
         const DenseLayerWeights *lw = &s->layers[l];
         DenseKVState *kv = &s->kv_states[l];
 
@@ -1757,6 +1917,8 @@ static int dense_forward_token(AsiArchSession *session, int32_t token_id, uint32
         if (lw->ffn_post_norm_f32)
             dense_rmsnorm(sc->proj_out, sc->proj_out, lw->ffn_post_norm_f32, H, s->rms_norm_eps);
         dense_add_vec(sc->x, sc->proj_out, H);
+        if (s->stream_evict)
+            dense_stream_advise_layer(s->cart, lw, 1);
     }
 
     dense_rmsnorm(sc->x_norm, sc->x, s->output_norm_f32, H, s->rms_norm_eps);
@@ -1895,7 +2057,7 @@ static int dense_forward_chunk(DenseSession *s,
     const AsiV2ModelConfig *c = &s->cart->config;
     uint32_t H = c->hidden_size;
     uint32_t I = c->intermediate_size;
-    float attn_scale = 1.0f / sqrtf((float)s->head_dim);
+    float attn_scale = (s->rope_attn_mscale * s->rope_attn_mscale) / sqrtf((float)s->head_dim);
     DenseScratch *sc = &s->scratch;
 
     DenseEmbdBatchCtx ectx = {s, token_ids, sc->xb, B};
@@ -1908,8 +2070,13 @@ static int dense_forward_chunk(DenseSession *s,
                           NULL, s->layers[0].attn_norm_f32, B, H, s->rms_norm_eps,
                           0, 1, !s->fp32_ref);
 
+    if (s->stream_evict && c->n_layers > 0u)
+        dense_stream_advise_layer(s->cart, &s->layers[0], 0);
+
     for (uint32_t l = 0; l < c->n_layers; ++l)
     {
+        if (s->stream_evict && l + 1u < c->n_layers)
+            dense_stream_advise_layer(s->cart, &s->layers[l + 1u], 0);
         const DenseLayerWeights *lw = &s->layers[l];
         DenseKVState *kv = &s->kv_states[l];
 
@@ -2000,6 +2167,8 @@ static int dense_forward_chunk(DenseSession *s,
         dense_norm_quant_pool(s->pool, sc->xb, sc->projb, sc->xnb, sc->qx_h,
                               lw->ffn_post_norm_f32, next_an, B, H, s->rms_norm_eps,
                               1, (next_an != NULL), (next_an != NULL && !s->fp32_ref));
+        if (s->stream_evict)
+            dense_stream_advise_layer(s->cart, lw, 1);
     }
 
     int rc = 0;
@@ -2029,6 +2198,7 @@ static int dense_forward_batch(AsiArchSession *session,
     if (n_tokens == 1u)
         return dense_forward_token(session, token_ids[0], pos_start, out_last_logits);
 
+    /* LILA_ASI_BATCH_CHUNK_MAX: Maximum prompt tokens per dense prefill chunk batch (default: ASI_DENSE_DEFAULT_BATCH_CHUNK = 512). */
     uint32_t chunk_max = ASI_DENSE_DEFAULT_BATCH_CHUNK;
     const char *env_cm = getenv("LILA_ASI_BATCH_CHUNK_MAX");
     if (env_cm && env_cm[0] != '\0')

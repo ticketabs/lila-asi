@@ -141,6 +141,67 @@ ASI_API int lila_asi_requant_q3_splitlut(const float *src_f32,
                                          int search_steps,
                                          uint8_t *dst);
 
+/*
+ * ============================================================================
+ * Runtime Environment Switches Reference (all default cleanly when unset)
+ * ============================================================================
+ * Presets & LM-Head Screening (Sieve, E03):
+ *   LILA_ASI_MODE=fast|balanced|exact  High-level preset: fast (default: 1bit1024 K=2048,
+ *                                      spec ON, 50% sparse ffn_down), balanced (2bit1024 K=1024),
+ *                                      exact (Sieve OFF, spec OFF, dense ffn_down).
+ *   LILA_ASI_LMHEAD_MODE=off|1bit512|1bit1024|2bit1024  Override Sieve sketch mode (off = full vocab).
+ *   LILA_ASI_LMHEAD_K=<int>            Top-K candidates refined by Stage 2 (default 2048/1024).
+ *   LILA_ASI_LMHEAD_PREFILL=0|1        Apply Sieve on prefill logits (default 0: exact).
+ *   LILA_ASI_LMHEAD_STATS=0|1          Print Sieve build/timing diagnostics to stderr (default 0).
+ *   LILA_ASI_DISABLE_E05=0|1           Set 1/t/y to disable E05 <tool_call> DFA + sparse LM-head
+ *                                      bypass/fast-forward for debugging or latency ablation (default 0).
+ *
+ * Torrent & Decode/Prefill Kernels (E07):
+ *   LILA_ASI_CHUNKWY=0|1               Enable ChunkWY-32 parallel DeltaNet prefill (default 0).
+ *                                      Math is exact under FP32_REF=1, but empirical Broadwell 2T
+ *                                      prefill showed v2.3 AVX2 sequential DeltaNet beats ChunkWY-32
+ *                                      by 23%-55% due to scratch alloc & multi-GEMM overhead; opt-in.
+ *   LILA_ASI_BLIS_PREFILL=0|1          Enable L1-blocked BLIS 6x16 prefill GEMM (default 1).
+ *   LILA_ASI_BLIS_MIN_TOKENS=<int>     Min batch tokens B to engage BLIS 6x16 (default 96).
+ *   LILA_ASI_FFN_SPARSE_KEEP=<0..1>    Active channel keep fraction for col-major Q4 ffn_down
+ *                                      (default 0.5 in fast preset, 1.0 in balanced/exact).
+ *   LILA_ASI_SPECULATIVE=0|1           Enable self-speculative multi-token draft verify (default 1).
+ *   LILA_ASI_SPEC_GATE=0|1             Share Sieve Stage-1 screening across draft lanes (default 1).
+ *   LILA_ASI_SPEC_DRAFT_LEN=<1..3>     Draft horizon (capped at <=2 on Q4_REPACK to prevent YMM spill).
+ *   LILA_ASI_SPEC_STATS=0|1            Print speculative acceptance stats to stderr (default 0).
+ *   LILA_ASI_Q6K_DOT2=0|1 / Q4K_DOT2   Enable paired 2-row Q8K SIMD matvec kernels (default 1).
+ *   LILA_ASI_MATVEC_CHUNK=<int>        Row work chunk size for pool workers (default 64).
+ *   LILA_ASI_LMHEAD_CHUNK=<int>        Row chunk size for lm_head workers (default 512).
+ *   LILA_ASI_FUSED_CHUNK=<int>         Row chunk size for fused projections (default 32).
+ *   LILA_ASI_BATCH_CHUNK_MAX=<int>     Max tokens per prefill batch chunk (default 512).
+ *
+ * E08 Scale, Streaming & Multi-Arch Switches:
+ *   LILA_ASI_STREAM_EVICT=0|1          Enable per-layer MADV_WILLNEED lookahead prefetch + strict
+ *                                      interior MADV_DONTNEED page eviction for bounded-RAM streaming
+ *                                      of large cartridges (default 0: keep resident pages cached).
+ *   LILA_ASI_ROPE_SCALE_MODE=standard|linear|ntk|yarn|llama3
+ *                                      Unified dense-transformer RoPE context-extension scaling
+ *                                      (default standard).
+ *   LILA_ASI_ROPE_SCALE_FACTOR=<float> RoPE context extension factor >= 1.0 (default 1.0).
+ *   LILA_ASI_ROPE_ORIG_CTX=<int>       Original training context for YaRN/Llama-3.1 ramps.
+ *
+ * Correctness, Security, Vision, Threading & Telemetry:
+ *   LILA_ASI_FP32_REF=0|1              Force slow unquantized FP32 reference matmuls for golden parity.
+ *   LILA_ASI_VERIFY_CRC=0|1            Force eager startup CRC-64 check over bulk mmap weight blobs.
+ *   LILA_ASI_NO_HUGEPAGE=0|1           Disable MADV_HUGEPAGE (THP) hint on weight mmap (default 0).
+ *   LILA_ASI_REQUIRE_SIGNATURE=0|1     Fail closed in open() unless valid Ed25519 signature present.
+ *   LILA_ASI_TRUSTED_PUBKEY=<64hex>    Expected Ed25519 publisher public key hex string.
+ *   LILA_ASI_VISION_EXEC=auto|fast|graph  Select ViT fast kernel vs ASIG0001 universal graph DAG.
+ *   LILA_ASI_VISION_FAST_Q8=0|1        Dynamic Q8xQ8 ViT linear path (default 0; fails 1e-5 tol check).
+ *   LILA_ASI_SPIN_LIMIT=<int>          Thread-pool pause spin iterations before sleep (default 2048/64).
+ *   LILA_ASI_PROFILE=0|1               Print per-op decode/prefill timing breakdown to stderr.
+ *   LILA_ASI_DEBUG_TOKENS=0|1          Print CLI tokenizer load diagnostics.
+ * Python SDK / Server Switches (src/core/{asi_backend,lilacore}.py):
+ *   LILA_ASI_PATH=<path>, LILA_ASI_LIB=<path>, LILA_ASI_ARCH=avx2|scalar,
+ *   LILA_ASI_DISABLE_DISK_PREFIX=0|1, LILA_ASI_PREFIX_CACHE_DIR=<dir>,
+ *   LILA_ASI_PREFIX_CACHE_MAX_FILES=<int>, LILA_ASI_REPEAT_PENALTY=<float>
+ * ============================================================================
+ */
 #ifdef __cplusplus
 }
 #endif

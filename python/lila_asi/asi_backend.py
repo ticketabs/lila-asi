@@ -242,7 +242,7 @@ ASI_VERSION_CATALOG: Dict[str, Dict[str, Optional[object]]] = {
         "feature_working_name": ASI_TORRENT_WORKING_NAME,
         "status": "active_promoted_source",
         "location": "engine/asi/liblila_asi.so (q4k.h, asi_arch.c, asi_v2.c, asi_requant.py)",
-        "summary": "Torrent (E07): Q4_REPACK (4.25 bpw) + sparse col-major ffn_down + ChunkWY-32 DeltaNet prefill + BLIS 6x16 (>=96 tok) + B<=2 spec cap + MADV_HUGEPAGE + slice-by-8 CRC-64.",
+        "summary": "Torrent (E07): Q4_REPACK (4.25 bpw) + sparse col-major ffn_down + BLIS 6x16 (>=96 tok) + opt-in ChunkWY-32 + B<=2 spec cap + MADV_HUGEPAGE + slice-by-8 CRC-64.",
     },
 }
 
@@ -250,9 +250,11 @@ ASI_VERSION_CATALOG: Dict[str, Dict[str, Optional[object]]] = {
 def active_asi_label() -> str:
     """Return the active ASI engine version, plain-English preset, Sieve status, and speculative mode."""
     preset = resolve_asi_mode()
+    # LILA_ASI_LMHEAD_MODE=off disables the 2-stage Sieve for exhaustive full-vocabulary scoring
     lhm = os.environ.get("LILA_ASI_LMHEAD_MODE", "").strip().lower()
     sieve_off = lhm in ("off", "0", "none", "false") or (not lhm and preset == "exact")
     sieve_tag = "exact lm_head" if sieve_off else f"with {ASI_SIEVE_WORKING_NAME}"
+    # LILA_ASI_SPECULATIVE=0 turns off self-speculative multi-token draft verification
     spec_env = os.environ.get("LILA_ASI_SPECULATIVE", "").strip()
     spec_off = (spec_env == "0") or (not spec_env and preset == "exact")
     spec_tag = "speculative=off" if spec_off else "speculative=on"
@@ -588,6 +590,7 @@ class IncrementalBpeUtf8Decoder:
 
 def _host_supports_avx2_fma_f16c() -> bool:
     """Return True when the host CPU supports AVX2 + FMA + F16C for portable library selection."""
+    # LILA_ASI_ARCH=scalar|avx2 forces portable scalar vs AVX2+FMA+F16C shared library selection
     override = os.environ.get("LILA_ASI_ARCH", "").strip().lower()
     if override == "scalar":
         return False
@@ -608,6 +611,7 @@ def _host_supports_avx2_fma_f16c() -> bool:
 
 
 def _default_lib_path() -> Path:
+    # LILA_ASI_LIB overrides shared library discovery with an explicit .so/.dll/.dylib path
     env_path = os.environ.get("LILA_ASI_LIB")
     if env_path:
         return Path(env_path)
@@ -696,6 +700,8 @@ class AsiRuntime:
             self._lib.lila_asi_close(self._model)
             raise RuntimeError(f"lila_asi_session_create failed: {err.value.decode('utf-8', 'replace')}")
 
+        # LILA_ASI_DISABLE_DISK_PREFIX=1 skips on-disk ASIPFX02 prefix snapshots;
+        # LILA_ASI_PREFIX_CACHE_DIR sets a custom directory for saved prefix caches.
         raw_cache_dir: Optional[Union[str, Path]] = prefix_cache_dir
         if raw_cache_dir is None and os.environ.get("LILA_ASI_DISABLE_DISK_PREFIX") != "1":
             env_cache_dir = os.environ.get("LILA_ASI_PREFIX_CACHE_DIR", "").strip()
@@ -919,6 +925,7 @@ class AsiRuntime:
         """Lazily compile/refresh the model-triggered E05 C11 <tool_call> grammar from registered tools."""
         if not getattr(self, "_supports_e05", False):
             return False
+        # LILA_ASI_DISABLE_E05=1 turns off C11 <tool_call> DFA grammar constraints & sparse lm_head
         if os.environ.get("LILA_ASI_DISABLE_E05", "").strip() == "1":
             return False
         if "<tool_call>" not in self.tokenizer.vocab or "</tool_call>" not in self.tokenizer.vocab:
@@ -1446,6 +1453,7 @@ class AsiRuntime:
 
     @staticmethod
     def _fp32_ref_flag() -> int:
+        # LILA_ASI_FP32_REF=1 enables unquantized FP32 reference mode (also hashes into cache keys)
         raw = (os.environ.get("LILA_ASI_FP32_REF") or "").strip().lower()
         if raw in ("1", "true", "yes"):
             return 1
@@ -1456,6 +1464,7 @@ class AsiRuntime:
 
     @staticmethod
     def _max_prefix_cache_files() -> int:
+        # LILA_ASI_PREFIX_CACHE_MAX_FILES caps LRU retained .asipfx disk prefix files
         raw = (os.environ.get("LILA_ASI_PREFIX_CACHE_MAX_FILES") or "").strip()
         if not raw:
             return _DEFAULT_PREFIX_CACHE_MAX_FILES
@@ -1900,6 +1909,7 @@ class AsiRuntime:
             inc_decoder = self.tokenizer.create_incremental_decoder()
             recent_tokens: deque[int] = deque(maxlen=64)
             try:
+                # LILA_ASI_REPEAT_PENALTY applies repetition penalty over the recent 64-token window
                 repeat_penalty = float(os.environ.get("LILA_ASI_REPEAT_PENALTY", "1.12"))
             except ValueError:
                 repeat_penalty = 1.12

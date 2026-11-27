@@ -47,6 +47,8 @@ typedef struct {
 
 static E05HookState g_e05_hook;
 
+/* Opt-out switch: LILA_ASI_DISABLE_E05=1 (or t/y) disables the C11 <tool_call> JSON-Schema
+ * DFA, forced-token fast-forward, and sparse LM-head row evaluation for A/B debugging. */
 static inline int e05_env_disabled(void) {
     const char *env = getenv("LILA_ASI_DISABLE_E05");
     return (env != NULL && (env[0] == '1' || env[0] == 't' || env[0] == 'T' || env[0] == 'y' || env[0] == 'Y'));

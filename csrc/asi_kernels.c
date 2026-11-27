@@ -260,6 +260,8 @@ static inline float hsum_f32x4(float32x4_t v)
 }
 #endif
 
+/* Opt-in dynamic Q8_0xQ8_0 ViT linear path (LILA_ASI_VISION_FAST_Q8=1).
+ * Disabled by default because Q8 activation rounding misses strict 1e-5 FP32 parity checks. */
 static inline int asi_fast_q8_enabled(void)
 {
     const char *v = getenv("LILA_ASI_VISION_FAST_Q8");
